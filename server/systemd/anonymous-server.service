@@ -1,0 +1,31 @@
+[Unit]
+Description=Anonymous Server — relais chiffré, sans identité applicative
+Documentation=https://github.com/yo-le-zz/anonymous
+After=network.target
+
+[Service]
+Type=simple
+User=anonymous
+Group=anonymous
+ExecStart=/usr/bin/anonymous-server
+Restart=on-failure
+RestartSec=5
+Environment=ANONYMOUS_SERVER_CONFIG=/etc/anonymous/server.toml
+
+# Durcissement — adapté aux chemins réellement nécessaires, sans
+# casser le fonctionnement du service.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/anonymous /var/log/anonymous
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,171 @@
+# Anonymous
+
+Anonymous est un chat en groupe **chiffré de bout en bout**, **sans
+compte**, **sans serveur central**, dont le serveur ne peut par
+conception ni lire les messages ni les attribuer à une identité
+applicative permanente.
+
+> ⚠ **Anonymous ne garantit pas l'anonymat réseau absolu.** Votre
+> fournisseur d'accès, un reverse proxy, ou votre hébergeur peuvent
+> observer des métadonnées de connexion (IP, horaires, volumétrie),
+> même si le contenu de vos messages reste chiffré de bout en bout.
+> Voir `docs/privacy.md` pour le modèle de menace complet.
+
+## En bref
+
+- **Chiffrement de bout en bout** : X25519 + HKDF-SHA256 + AES-256-GCM
+  / ChaCha20-Poly1305, avec rotation régulière des clés (voir
+  `docs/crypto.md`).
+- **Identité de session éphémère** : chaque connexion affiche un
+  numéro temporaire (`Anonymous #583921`), attribué par le serveur,
+  jamais un compte — nouveau à chaque connexion, invalidé au
+  redémarrage du serveur, protégé contre l'usurpation par signature
+  Ed25519.
+- **Aucun serveur central** : n'importe qui installe et héberge son
+  propre serveur, puis en partage l'adresse.
+- **Fichiers chiffrés côté client** avant envoi (images, vidéos,
+  documents), noms de fichiers protégés côté serveur.
+- **Basse consommation** : SQLite, pas de Redis/Celery/PostgreSQL,
+  une seule tâche périodique légère pour la rétention.
+- **Messages éphémères configurables** (par âge ou par quantité).
+
+## Installation
+
+### Client
+
+```bash
+sudo apt install ./anonymous_1.0.0_amd64.deb
+anonymous
+```
+
+### Serveur
+
+```bash
+sudo apt install ./anonymous-server_1.0.0_amd64.deb
+sudo systemctl enable --now anonymous-server
+```
+
+Voir `docs/server.md` pour la configuration complète
+(`/etc/anonymous/server.toml`), le mot de passe serveur, la rétention,
+et le durcissement systemd.
+
+## Démarrage rapide
+
+```
+/connect http://mon-serveur:8000
+/room new mon-salon
+```
+
+Le client affiche l'invitation à partager **hors bande** (jamais via
+le chat lui-même) avec les personnes que vous voulez inviter :
+
+```
+anon1:xxxxxxxx:yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+```
+
+Sur un autre poste :
+
+```
+/connect http://mon-serveur:8000
+/room join anon1:xxxxxxxx:yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy mon-salon
+```
+
+Vous pouvez aussi établir un salon sans jamais faire transiter le
+secret lui-même, via un échange Diffie-Hellman X25519 :
+`/room exchange start` (voir `docs/crypto.md` §3.2).
+
+## Commandes du client
+
+```
+/help                          liste des commandes
+/connect URL [mot_de_passe]     se connecter à un serveur
+/disconnect                     se déconnecter
+/server                         état de connexion (serveur, salon, identité)
+/room new|join|use|list         gérer les salons
+/room exchange start|respond|finish   échange de secret par X25519
+/upload chemin                  envoyer un fichier chiffré
+/download id                    télécharger un fichier reçu
+/quit                           quitter
+texte + Entrée                  envoyer un message
+```
+
+Aucune commande `/edit` ni `/delete` : un message envoyé est
+immuable ; seule la rétention automatique configurée par
+l'administrateur du serveur peut supprimer d'anciens messages.
+
+## Documentation
+
+| Document | Contenu |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Vue d'ensemble, composants, autonomie des serveurs |
+| [`docs/crypto.md`](docs/crypto.md) | Protocole cryptographique complet (chiffrement + session/signature) |
+| [`docs/privacy.md`](docs/privacy.md) | Modèle de menace, justification de chaque donnée conservée |
+| [`docs/server.md`](docs/server.md) | Installation, configuration, systemd, mot de passe, rétention |
+| [`docs/https.md`](docs/https.md) | Exposition publique via Caddy / Nginx / Traefik |
+
+## Modèle de menace en un paragraphe
+
+Le serveur reçoit et stocke des enveloppes chiffrées opaques qu'il ne
+peut pas déchiffrer, ne connaît jamais les clés privées des clients,
+et n'a aucun mécanisme pour relier un message à une identité
+applicative persistante. Une session (numéro affiché
+"Anonymous #XXXXXX") est un pseudonyme purement temporaire, vérifié
+par signature Ed25519 pour empêcher l'usurpation, vivant uniquement en
+mémoire et disparaissant à l'expiration ou au redémarrage du serveur.
+Ce que ce modèle NE couvre PAS : l'anonymat au niveau réseau
+(métadonnées de connexion visibles par l'hébergeur, le réseau, ou un
+reverse proxy) et la confidentialité persistante par message façon
+Signal/MLS. Détails complets dans `docs/crypto.md` et
+`docs/privacy.md`.
+
+## Limites de l'anonymat
+
+- Le serveur voit les adresses IP qui s'y connectent (au niveau TCP),
+  utilisées uniquement en mémoire pour la limitation de débit anti-abus,
+  jamais journalisées ni stockées avec un message.
+- Un reverse proxy placé devant le serveur peut avoir ses propres logs
+  d'accès, indépendants de ce que fait Anonymous lui-même.
+- Un participant du salon peut toujours partager en dehors d'Anonymous
+  ce qu'il y a lu — le chiffrement protège contre le serveur, pas
+  contre les autres membres du salon.
+- Ce projet **ne fait pas** office d'outil d'anonymat réseau comme Tor
+  ; il peut être combiné avec un tel outil si c'est votre besoin.
+
+## Développement
+
+```bash
+uv sync
+uv run pytest
+```
+
+Construire les paquets `.deb` (client + serveur) :
+
+```bash
+./build.sh
+```
+
+nécessite [`uv`](https://github.com/astral-sh/uv) et
+[`meb`](https://github.com/yo-le-zz/meb).
+
+## Rotation des clés et rétention (aperçu)
+
+```toml
+[crypto]
+key_rotation_messages = 100
+key_rotation_seconds = 3600
+
+[retention]
+enabled = true
+max_age_seconds = 86400   # 0 = illimité
+delete_oldest = true
+```
+
+Détails complets : `docs/crypto.md` (rotation) et `docs/server.md`
+(rétention, quotas, fichiers).
+
+## Licence et contributions
+
+Projet communautaire — voir les fichiers sous `docs/` avant toute
+contribution touchant à la cryptographie ou au stockage : toute
+modification qui réintroduirait une identité persistante, un
+`client_token`, ou un mapping utilisateur → messages sera refusée.

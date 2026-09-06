@@ -1,0 +1,62 @@
+# Paquet .deb du serveur Anonymous.
+#
+# NOTE HONNÊTE : la syntaxe exacte attendue par `meb` pour les champs
+# `services`, `resources`, `conffiles` et `permissions` n'est pas
+# documentée publiquement au moment de l'écriture de ce fichier. Les
+# valeurs ci-dessous sont un meilleur effort basé sur les conventions
+# habituelles des outils de packaging Debian (chemins "source:destination"
+# pour les ressources, "chemin:mode:owner:group" pour les permissions).
+# Avant votre premier vrai build, vérifiez avec `meb --help` /
+# `meb build --dry-run` (si disponible) et ajustez si le format diffère.
+# Les scripts postinst/prerm/postrm (server/debian/) créent de toute
+# façon l'utilisateur système et posent les permissions correctes par
+# eux-mêmes, donc le fonctionnement du paquet ne dépend pas
+# uniquement de ces champs meb.
+
+name = "anonymous-server"
+version = "1.0.0"
+description = "Anonymous Server — relais chiffré décentralisé, sans identité applicative"
+language = "python"
+maintainer = "yolezz"
+
+services = [
+    "server/systemd/anonymous-server.service",
+]
+
+resources = [
+    "etc/anonymous/server.toml:/etc/anonymous/server.toml",
+]
+
+man = []
+
+conffiles = [
+    "/etc/anonymous/server.toml",
+]
+
+permissions = [
+    "/etc/anonymous/server.toml:0640:root:anonymous",
+    "/var/lib/anonymous:0700:anonymous:anonymous",
+    "/var/log/anonymous:0700:anonymous:anonymous",
+]
+
+[package]
+architecture = "amd64"
+section = "net"
+priority = "optional"
+depends = []
+
+[app]
+icon = "assets/anonymous.png"
+exec = "dist/anonymous-server"
+category = "Network"
+desktop = false
+terminal = false
+startup_wm_class = ""
+readme = "README.md"
+
+[completions]
+
+[scripts]
+postinst = "server/debian/postinst"
+prerm = "server/debian/prerm"
+postrm = "server/debian/postrm"

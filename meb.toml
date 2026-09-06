@@ -1,0 +1,29 @@
+name = "anonymous"
+version = "1.0.0"
+description = "Anonymous — client de chat chiffré de bout en bout, sans compte ni serveur central"
+language = "python"
+maintainer = "yolezz"
+services = []
+resources = []
+man = []
+conffiles = []
+permissions = []
+
+[package]
+architecture = "amd64"
+section = "net"
+priority = "optional"
+depends = []
+
+[app]
+icon = "assets/anonymous.png"
+exec = "dist/anonymous"
+category = "Network"
+desktop = true
+terminal = true
+startup_wm_class = ""
+readme = "README.md"
+
+[completions]
+
+[scripts]
