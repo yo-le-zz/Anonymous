@@ -1,0 +1,20 @@
+#!/bin/sh
+# postrm — n'agit que sur `apt purge` (action "purge"). Une
+# désinstallation simple (`apt remove`) laisse les données et
+# l'utilisateur système intacts, conformément aux conventions Debian.
+
+set -e
+
+if [ "$1" = "purge" ]; then
+    if command -v deluser >/dev/null 2>&1; then
+        deluser --system anonymous >/dev/null 2>&1 || true
+    fi
+
+    if command -v delgroup >/dev/null 2>&1; then
+        delgroup --system anonymous >/dev/null 2>&1 || true
+    fi
+
+    rm -rf /var/lib/anonymous /var/log/anonymous
+fi
+
+exit 0

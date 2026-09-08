@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # LINUX (amd64) : binaires + paquets .deb
+  # ============================================================
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+
+      - name: Install system build dependencies (Nuitka onefile)
+        run: sudo apt-get update && sudo apt-get install -y patchelf dpkg-dev
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Run test suite
+        run: uv run pytest tests -v
+
+      - name: Build binaries + .deb packages
+        run: ./build.sh
+
+      - name: Archive raw Linux binaries
+        run: |
+          mkdir -p artifacts
+          tar -C dist -czf artifacts/anonymous-linux-amd64.tar.gz anonymous
+          tar -C dist -czf artifacts/anonymous-server-linux-amd64.tar.gz anonymous-server
+          cp dist/*.deb artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: artifacts/*
+
+  # ============================================================
+  # WINDOWS (amd64) : exécutables .exe
+  # ============================================================
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Run test suite
+        run: uv run pytest tests -v
+
+      - name: Build client (Nuitka onefile)
+        run: >
+          uv run python -m nuitka
+          --onefile
+          --mingw64
+          --follow-imports
+          --output-dir=dist
+          --output-filename=anonymous.exe
+          client/src/main.py
+
+      - name: Build server (Nuitka onefile)
+        run: >
+          uv run python -m nuitka
+          --onefile
+          --mingw64
+          --follow-imports
+          --output-dir=dist
+          --output-filename=anonymous-server.exe
+          server/src/main.py
+
+      - name: Package zip archives
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp etc/anonymous/server.toml dist/server.toml.example
+          cp README.md dist/README.md
+          (cd dist && 7z a -tzip ../artifacts/anonymous-windows-amd64.zip anonymous.exe README.md)
+          (cd dist && 7z a -tzip ../artifacts/anonymous-server-windows-amd64.zip anonymous-server.exe server.toml.example README.md)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: artifacts/*
+
+  # ============================================================
+  # PUBLICATION DE LA RELEASE GITHUB
+  # ============================================================
+  release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-build"
+          path: release-assets
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la release-assets
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          name: "Anonymous ${{ github.ref_name }}"

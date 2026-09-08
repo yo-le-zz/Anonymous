@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# Build artifacts
+dist/
+build/
+*.build/
+*.dist/
+*.onefile-build/
+*.spec
+
+# Debian packaging staging
+dist/pkg/
+
+# Données locales de développement (jamais commitées : secrets/DB)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+server.toml
+!etc/anonymous/server.toml
+files/
+
+# Client : secrets locaux (ne devraient jamais être dans le dépôt)
+.anonymous/
+rooms.json
+servers.json
+
+# Éditeurs / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

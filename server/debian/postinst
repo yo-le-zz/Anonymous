@@ -1,0 +1,41 @@
+#!/bin/sh
+# postinst — exécuté après l'installation du paquet anonymous-server.
+# Crée un utilisateur système dédié, sans shell de connexion, et pose
+# des permissions restrictives sur les répertoires de données.
+
+set -e
+
+ANON_USER="anonymous"
+ANON_GROUP="anonymous"
+DATA_DIR="/var/lib/anonymous"
+LOG_DIR="/var/log/anonymous"
+CONFIG_DIR="/etc/anonymous"
+
+if ! getent group "$ANON_GROUP" >/dev/null 2>&1; then
+    addgroup --system "$ANON_GROUP"
+fi
+
+if ! getent passwd "$ANON_USER" >/dev/null 2>&1; then
+    adduser --system --ingroup "$ANON_GROUP" --home "$DATA_DIR" \
+        --no-create-home --shell /usr/sbin/nologin \
+        --gecos "Anonymous server" "$ANON_USER"
+fi
+
+mkdir -p "$DATA_DIR" "$DATA_DIR/files" "$LOG_DIR"
+
+chown -R "$ANON_USER:$ANON_GROUP" "$DATA_DIR" "$LOG_DIR"
+chmod 0700 "$DATA_DIR" "$DATA_DIR/files" "$LOG_DIR"
+
+# La configuration reste lisible par le groupe dédié uniquement — elle
+# peut contenir un hash de mot de passe (Argon2id, jamais le mot de
+# passe en clair, mais on reste prudent).
+chown root:"$ANON_GROUP" "$CONFIG_DIR/server.toml" 2>/dev/null || true
+chmod 0640 "$CONFIG_DIR/server.toml" 2>/dev/null || true
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+echo "Anonymous server installé."
+echo "Configurez /etc/anonymous/server.toml puis lancez :"
+echo "  sudo systemctl enable --now anonymous-server"
+
+exit 0

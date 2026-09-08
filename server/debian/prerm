@@ -1,0 +1,15 @@
+#!/bin/sh
+# prerm — exécuté avant la désinstallation du paquet anonymous-server.
+# Arrête et désactive le service proprement. Ne supprime PAS
+# /var/lib/anonymous (les données restent sur disque sauf purge
+# explicite via `apt purge`, cohérent avec les conventions Debian) :
+# ce comportement standard est délibéré, pas un oubli.
+
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop anonymous-server >/dev/null 2>&1 || true
+    systemctl disable anonymous-server >/dev/null 2>&1 || true
+fi
+
+exit 0

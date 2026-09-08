@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Run test suite
+        run: uv run pytest tests -v
+
+  privacy-audit:
+    name: Audit anti-identité (schéma SQLite réel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Vérifie le schéma SQLite réel (pas un grep heuristique)
+        # La vraie garantie est le contenu réel de la base, pas une
+        # recherche de mots-clés (qui produirait de faux positifs sur
+        # des commentaires légitimes comme "fingerprint" du salon ou
+        # la liste documentée des colonnes interdites dans
+        # database.py). Les tests tests/test_server/ couvrent déjà
+        # cela en détail ; ce job est une vérification indépendante et
+        # rapide, exécutée sur une base fraîchement initialisée.
+        shell: bash
+        run: |
+          cd server/src
+          uv run python -c "
+          import tempfile, os
+          import config
+          config.Config['storage']['database'] = os.path.join(tempfile.mkdtemp(), 'chat.db')
+          import database
+          database.configure(config.Config['storage']['database'])
+          database.init_database()
+          conn = database._connection()
+          forbidden = {'owner', 'client_token', 'owner_token_hash', 'user_id', 'client_id', 'ip', 'username', 'session_id', 'public_key'}
+          for table in ('messages', 'files', 'rooms'):
+              cols = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+              bad = cols & forbidden
+              assert not bad, f'colonne interdite dans {table}: {bad}'
+              print(table, '->', sorted(cols))
+          print('OK : aucune colonne interdite dans le schéma réel.')
+          "

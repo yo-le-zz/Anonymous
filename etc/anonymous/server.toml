@@ -1,0 +1,57 @@
+# Configuration du serveur Anonymous.
+# Toutes les valeurs sont validées au démarrage — voir docs/server.md
+# pour la description complète de chaque option.
+
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[network]
+public_url = ""
+
+[auth]
+enabled = false
+password_hash = ""
+
+[storage]
+database = "/var/lib/anonymous/chat.db"
+files = "/var/lib/anonymous/files"
+max_storage_bytes = 1073741824
+
+[messages]
+max_size = 10000
+max_messages = 10000
+
+[retention]
+enabled = true
+max_age_seconds = 0
+delete_oldest = true
+
+[files]
+enabled = true
+max_file_size = 52428800
+max_files_per_message = 5
+allowed_types = [
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "video/mp4",
+    "video/webm",
+    "application/pdf",
+]
+
+[crypto]
+key_rotation_messages = 100
+key_rotation_seconds = 3600
+
+[session]
+ttl_seconds = 21600
+
+[logging]
+access_logs = false
+
+[ratelimit]
+messages_per_minute = 30
+uploads_per_minute = 10
+sessions_per_minute = 20
+max_connections_per_ip = 20
