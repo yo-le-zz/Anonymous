@@ -71,7 +71,21 @@ def transaction():
             raise
 
 
+def _existing_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
 def init_database() -> None:
+    """Crée le schéma s'il n'existe pas, PUIS applique les migrations
+    incrémentales nécessaires sur une base déjà existante créée par une
+    version antérieure du serveur.
+
+    `CREATE TABLE IF NOT EXISTS` ne modifie jamais une table déjà
+    présente : sur une base créée avant l'introduction d'une colonne
+    (ex. `room`, `anonymous_number`), il faut l'ajouter explicitement
+    via `ALTER TABLE ... ADD COLUMN`, sans quoi le serveur refuse de
+    démarrer (`sqlite3.OperationalError: no such column`)."""
+
     with transaction() as connection:
         connection.execute(
             """
@@ -84,9 +98,7 @@ def init_database() -> None:
                 nonce TEXT NOT NULL,
                 ciphertext TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
-                created_at REAL NOT NULL,
-                anonymous_number INTEGER NOT NULL,
-                room TEXT NOT NULL DEFAULT 'general'
+                created_at REAL NOT NULL
             )
             """
         )
@@ -117,6 +129,28 @@ def init_database() -> None:
             )
             """
         )
+
+        # ---- Migrations incrémentales (bases pré-existantes) ----
+
+        messages_columns = _existing_columns(connection, "messages")
+
+        if "anonymous_number" not in messages_columns:
+            # Introduit avec les sessions éphémères signées (v1.0.0).
+            # Les lignes déjà en base n'ont, par définition, jamais été
+            # rattachées à une session : 0 est une valeur sentinelle
+            # neutre, jamais une valeur qu'une vraie session n'obtient
+            # (les numéros réels vont de 100000 à 999999 — voir
+            # session.py), donc sans ambiguïté ni fausse identité.
+            connection.execute(
+                "ALTER TABLE messages ADD COLUMN anonymous_number INTEGER NOT NULL DEFAULT 0"
+            )
+
+        if "room" not in messages_columns:
+            # Introduit avec les salons (v1.0.1). Les messages déjà en
+            # base retombent dans le salon par défaut.
+            connection.execute(
+                "ALTER TABLE messages ADD COLUMN room TEXT NOT NULL DEFAULT 'general'"
+            )
 
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages (created_at)"

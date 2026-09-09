@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 ARCH="amd64"
 DIST_DIR="dist"
 PKG_DIR="$DIST_DIR/pkg"

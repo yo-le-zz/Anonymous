@@ -39,14 +39,14 @@ applicative permanente.
 ### Client
 
 ```bash
-sudo apt install ./anonymous_1.0.1_amd64.deb
+sudo apt install ./anonymous_1.0.2_amd64.deb
 anonymous
 ```
 
 ### Serveur
 
 ```bash
-sudo apt install ./anonymous-server_1.0.1_amd64.deb
+sudo apt install ./anonymous-server_1.0.2_amd64.deb
 sudo systemctl enable --now anonymous-server
 ```
 
@@ -192,8 +192,8 @@ doit compiler sur l'OS cible).
   directement sur la page GitHub Release correspondante.
 
 ```bash
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 ## Rotation des clés et rétention (aperçu)

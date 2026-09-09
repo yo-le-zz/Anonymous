@@ -93,7 +93,7 @@ async def lifespan(app: FastAPI):
         await _retention_task
 
 
-app = FastAPI(title="Anonymous", version="1.0.1", lifespan=lifespan)
+app = FastAPI(title="Anonymous", version="1.0.2", lifespan=lifespan)
 
 
 # ============================================================

@@ -348,6 +348,76 @@ def test_file_path_traversal_rejected():
             pass
 
 
+def test_migration_adds_missing_columns_to_preexisting_database(tmp_path):
+    """Régression réelle observée en production : une base créée par
+    une version antérieure du serveur (avant l'ajout de `room`, ou
+    même avant `anonymous_number`) doit être migrée automatiquement au
+    démarrage plutôt que de faire planter le serveur avec
+    `sqlite3.OperationalError: no such column`."""
+
+    import sqlite3
+
+    # Simule exactement la base signalée : anonymous_number présent,
+    # mais pas encore `room` (schéma de la toute première version 1.0.0).
+    old_db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(old_db_path)
+    conn.execute(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            envelope_type TEXT NOT NULL,
+            protocol_version INTEGER NOT NULL,
+            algorithm TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            ciphertext TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            anonymous_number INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE TABLE files (file_id TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, created_at REAL NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO messages (envelope_type, protocol_version, algorithm, key_id, nonce, "
+        "ciphertext, size_bytes, created_at, anonymous_number) "
+        "VALUES ('msg', 1, 'AES-256-GCM', 'k.0', 'n', 'preexisting-ciphertext', 1, 123.0, 555555)"
+    )
+    conn.commit()
+    conn.close()
+
+    # Force une nouvelle connexion sur cette base (le thread de test a
+    # peut-être déjà une connexion en cache vers l'ancienne base).
+    if hasattr(database._local, "connection"):
+        database._local.connection.close()
+        del database._local.connection
+
+    database.configure(str(old_db_path))
+    database.init_database()  # ne doit PAS lever d'exception
+
+    messages = database.get_messages(10)
+    assert len(messages) == 1
+    assert messages[0]["ciphertext"] == "preexisting-ciphertext"
+    assert messages[0]["anonymous_number"] == 555555
+    # Le message pré-existant retombe dans le salon par défaut.
+    assert messages[0]["room"] == "general"
+
+    # Un nouveau message peut désormais être inséré normalement.
+    new_message = database.create_message(
+        envelope_type="msg", protocol_version=1, algorithm="AES-256-GCM",
+        key_id="k.1", nonce="n2", ciphertext="new-message", anonymous_number=111111,
+        room="general",
+    )
+    assert new_message["room"] == "general"
+
+    # Reconnecte la base de test normale pour la suite de la suite.
+    database._local.connection.close()
+    del database._local.connection
+    database.configure(str(_DB_PATH))
+
+
 def test_privacy_schema_has_no_identity_columns():
     connection = database._connection()
 

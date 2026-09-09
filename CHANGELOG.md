@@ -3,6 +3,26 @@
 Toutes les modifications notables de ce projet sont documentées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.0.2] — 2026-09-08
+
+### Corrigé
+- **Bug critique de démarrage sur mise à jour** : sur une base SQLite
+  déjà existante (créée par une version antérieure du serveur),
+  `CREATE TABLE IF NOT EXISTS` ne modifie jamais une table déjà
+  présente. Une base créée avant l'introduction de la colonne `room`
+  (v1.0.1) — ou même avant `anonymous_number` (v1.0.0) — faisait donc
+  planter le serveur au démarrage avec
+  `sqlite3.OperationalError: no such column: room`, en boucle de
+  redémarrage systemd infinie. `database.init_database()` applique
+  désormais de vraies migrations incrémentales (`ALTER TABLE ... ADD
+  COLUMN`) pour chaque colonne manquante détectée, avec des valeurs
+  par défaut neutres pour les lignes déjà existantes (`room='general'`,
+  `anonymous_number=0` — cette dernière valeur n'est jamais attribuée
+  à une vraie session, dont les numéros vont de 100000 à 999999).
+  Testé explicitement pour une remise à niveau depuis n'importe quelle
+  version antérieure (voir
+  `test_migration_adds_missing_columns_to_preexisting_database`).
+
 ## [1.0.1] — 2026-09-07
 
 ### Corrigé
