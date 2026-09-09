@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 ARCH="amd64"
 DIST_DIR="dist"
 PKG_DIR="$DIST_DIR/pkg"
@@ -56,6 +56,9 @@ echo "[2/4] Compilation du client (Nuitka --onefile)..."
 uv run python -m nuitka \
     --onefile \
     --follow-imports \
+    --include-module=websockets.asyncio.client \
+    --include-package=cryptography \
+    --include-package=requests \
     --output-dir="$DIST_DIR" \
     --output-filename="anonymous" \
     "client/src/main.py"
@@ -69,6 +72,13 @@ echo "[3/4] Compilation du serveur (Nuitka --onefile)..."
 uv run python -m nuitka \
     --onefile \
     --follow-imports \
+    --include-package=uvicorn \
+    --include-package=starlette \
+    --include-package=fastapi \
+    --include-package=pydantic \
+    --include-package=websockets \
+    --include-package=cryptography \
+    --include-package=argon2 \
     --output-dir="$DIST_DIR" \
     --output-filename="anonymous-server" \
     "server/src/main.py"

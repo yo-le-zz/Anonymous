@@ -3,6 +3,31 @@
 Toutes les modifications notables de ce projet sont documentées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.0.3] — 2026-09-08
+
+### Corrigé
+- **Client compilé (Nuitka) incapable de se connecter en temps réel** :
+  `⚠ Flux temps réel indisponible (No module named 'websockets.asyncio')`.
+  La bibliothèque `websockets` (>= 13) utilise un mécanisme d'imports
+  paresseux (`__getattr__` au niveau module, PEP 562) pour charger
+  `websockets.asyncio.client` seulement au moment où
+  `websockets.connect` est réellement utilisé. Ce genre d'import
+  dynamique est invisible à l'analyse statique de Nuitka
+  (`--follow-imports` ne le détecte pas), donc le sous-module n'était
+  jamais embarqué dans le binaire compilé — le programme fonctionnait
+  normalement en source (`python main.py`) mais échouait une fois
+  packagé. `build.sh` et `.github/workflows/release.yml` demandent
+  désormais explicitement `--include-module=websockets.asyncio.client`
+  à Nuitka. Reproduit et vérifié avec un binaire réellement compilé
+  avant/après correctif (l'erreur exacte de l'utilisateur a été
+  reproduite à l'identique sans le flag, puis résolue avec).
+- Ajout de `--include-package=cryptography`/`requests` (client) et
+  `--include-package=uvicorn`/`starlette`/`fastapi`/`pydantic`/
+  `websockets`/`argon2`/`cryptography` (serveur) par précaution
+  défensive : ces bibliothèques ont des historiques connus d'imports
+  conditionnels ou différés selon la plateforme, susceptibles de
+  passer inaperçus à l'analyse statique dans d'autres configurations.
+
 ## [1.0.2] — 2026-09-08
 
 ### Corrigé

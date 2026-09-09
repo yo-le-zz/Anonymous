@@ -3,7 +3,7 @@
 ## 1. Installation via le paquet `.deb`
 
 ```bash
-sudo apt install ./anonymous-server_1.0.2_amd64.deb
+sudo apt install ./anonymous-server_1.0.3_amd64.deb
 ```
 
 Ceci installe :

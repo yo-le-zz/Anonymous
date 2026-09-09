@@ -73,6 +73,9 @@ jobs:
           --onefile
           --mingw64
           --follow-imports
+          --include-module=websockets.asyncio.client
+          --include-package=cryptography
+          --include-package=requests
           --output-dir=dist
           --output-filename=anonymous.exe
           client/src/main.py
@@ -83,6 +86,13 @@ jobs:
           --onefile
           --mingw64
           --follow-imports
+          --include-package=uvicorn
+          --include-package=starlette
+          --include-package=fastapi
+          --include-package=pydantic
+          --include-package=websockets
+          --include-package=cryptography
+          --include-package=argon2
           --output-dir=dist
           --output-filename=anonymous-server.exe
           server/src/main.py
