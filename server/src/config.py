@@ -64,7 +64,58 @@ DEFAULTS: dict[str, Any] = {
         "uploads_per_minute": 10,
         "sessions_per_minute": 20,
         "max_connections_per_ip": 20,
+        # Voir docs/server.md "Anti-spam" : quand activé, une IP qui
+        # dépasse la limite subit un cooldown qui double à chaque
+        # récidive (1s, 2s, 4s, 8s...) au lieu d'un simple rejet fixe.
+        # Explicitement configurable et TOUJOURS annoncé publiquement
+        # via /server-info, pour que les clients sachent à quoi
+        # s'attendre.
+        "progressive_cooldown_enabled": True,
+        "progressive_cooldown_max_seconds": 300,
     },
+    # Fonctionnalités optionnelles. Certaines sont réellement appliquées
+    # par le serveur (reactions/typing, car leur `type` d'enveloppe est
+    # visible du serveur sans déchiffrement) ; d'autres sont purement
+    # indicatives (replies, room_exchange), car elles vivent entièrement
+    # dans le contenu chiffré que le serveur ne peut jamais inspecter.
+    # Voir docs/crypto.md pour le détail de cette distinction.
+    "features": {
+        "reactions_enabled": True,
+        "typing_indicators_enabled": True,
+        "replies_enabled": True,  # indicatif seulement, voir ci-dessus
+        "room_exchange_enabled": True,  # indicatif seulement (mécanisme 100% client)
+    },
+    # Administration ephémère (voir docs/crypto.md "Administration
+    # sans identité") : aucun compte, aucune identité persistante.
+    # Si `password_hash` est vide, la PREMIÈRE session qui réclame le
+    # rôle l'obtient (jusqu'au redémarrage du serveur). Si un hash est
+    # configuré, n'importe quelle session qui fournit le bon mot de
+    # passe devient admin — plusieurs sessions peuvent donc être admin
+    # simultanément si le mot de passe est partagé, ce qui est voulu.
+    "admin": {"password_hash": ""},
+    # Bascule fondamentale de confidentialité. Par défaut (true), le
+    # serveur ne reçoit et ne peut jamais recevoir de texte en clair
+    # (voir docs/crypto.md). Si mis à `false` : le serveur PEUT alors
+    # appliquer une modération réelle sur le contenu (voir
+    # `[moderation]`), au prix de la confidentialité de bout en bout.
+    # Ce mode n'est PAS activé par défaut et doit rester une décision
+    # explicite et documentée de l'administrateur (voir docs/privacy.md).
+    "privacy": {"e2ee": True},
+    "moderation": {
+        "banned_words_enabled": False,
+        "banned_words_file": "",
+    },
+    "web": {
+        "enabled": True,
+        "public_page": True,
+        "server_name": "Anonymous Server",
+        "description": "",
+        "show_online_count": True,
+        "show_room_counts": True,
+        "show_message_count": True,
+        "show_storage_usage": True,
+    },
+    "temporary": {"enabled": False, "lifetime_seconds": 0},
 }
 
 
@@ -140,6 +191,51 @@ def _validate(config: dict) -> None:
     if not rooms["default_room"]:
         raise ConfigError("rooms.default_room ne peut pas être vide.")
 
+    ratelimit = config["ratelimit"]
+    if ratelimit["progressive_cooldown_max_seconds"] <= 0:
+        raise ConfigError("ratelimit.progressive_cooldown_max_seconds doit être positif.")
+
+    moderation = config["moderation"]
+    if moderation["banned_words_enabled"] and not moderation["banned_words_file"]:
+        raise ConfigError(
+            "moderation.banned_words_enabled = true nécessite moderation.banned_words_file."
+        )
+    if not config["privacy"]["e2ee"] and moderation["banned_words_enabled"]:
+        # Autorisé, mais seulement dans ce mode explicite — voir
+        # docs/privacy.md. Rien à valider de plus ici : le filtrage
+        # réel n'est appliqué que si e2ee = false (voir main.py).
+        pass
+
+    temporary = config["temporary"]
+    if temporary["enabled"] and temporary["lifetime_seconds"] <= 0:
+        raise ConfigError(
+            "temporary.enabled = true nécessite temporary.lifetime_seconds > 0."
+        )
+
+    web = config["web"]
+    if not isinstance(web["server_name"], str) or not web["server_name"].strip():
+        raise ConfigError("web.server_name ne peut pas être vide.")
+
+
+# Champs qui peuvent être rechargés SANS redémarrer le serveur (voir
+# `reload_hot_fields` plus bas et docs/server.md "Rechargement à
+# chaud"). Tout ce qui touche à l'écoute réseau, au stockage, aux
+# sessions ou à l'authentification globale exige un vrai redémarrage :
+# les changer à chaud créerait un état incohérent (connexions
+# existantes, fichiers déjà ouverts, jetons déjà émis...).
+HOT_RELOADABLE_SECTIONS = (
+    "messages",
+    "retention",
+    "files",
+    "rooms",
+    "ratelimit",
+    "features",
+    "privacy",
+    "moderation",
+    "web",
+    "logging",
+)
+
 
 def load_config() -> dict:
     path = _config_path()
@@ -158,4 +254,68 @@ def load_config() -> dict:
     return config
 
 
-Config = load_config()
+_config_file_path = _config_path()
+_config_file_mtime = _config_file_path.stat().st_mtime if _config_file_path and _config_file_path.exists() else None
+
+# Le chargement au démarrage ne doit JAMAIS faire planter l'import de
+# ce module avec une trace Python brute : une commande comme
+# `anonymous-server --version` ou `anonymous-server check-config` doit
+# pouvoir s'exécuter (et signaler clairement le problème) même si
+# server.toml est actuellement invalide. `_load_error` porte l'erreur
+# pour que les appelants (CLI, démarrage réel du serveur) décident
+# comment réagir ; `Config` retombe sur les valeurs par défaut dans ce
+# cas, jamais sur un état à moitié construit.
+_load_error: ConfigError | None = None
+
+try:
+    Config = load_config()
+except ConfigError as _error:
+    _load_error = _error
+    Config = dict(DEFAULTS)
+
+
+def config_file_changed() -> bool:
+    """Vérification légère (un seul `stat()`) : le fichier de config a-t-il
+    changé depuis le dernier chargement ? Utilisé pour la revérification
+    périodique en fonctionnement — voir `retention.py`."""
+
+    if _config_file_path is None or not _config_file_path.exists():
+        return False
+
+    try:
+        current_mtime = _config_file_path.stat().st_mtime
+    except OSError:
+        return False
+
+    return _config_file_mtime is None or current_mtime != _config_file_mtime
+
+
+def reload_hot_fields() -> list[str]:
+    """Recharge le fichier de configuration et met à jour, EN PLACE
+    (`Config` reste le même objet partagé par tous les modules qui ont
+    fait `from config import Config`), uniquement les sections listées
+    dans `HOT_RELOADABLE_SECTIONS`. Retourne la liste des sections
+    effectivement modifiées. Ne touche jamais aux sections qui exigent
+    un vrai redémarrage (server, storage, session, auth, crypto,
+    network) — si elles ont changé dans le fichier, elles sont
+    ignorées et un avertissement doit être journalisé par l'appelant.
+
+    Lève `ConfigError` si le nouveau fichier est invalide : dans ce
+    cas, la configuration en mémoire n'est PAS modifiée (on continue
+    de tourner avec l'ancienne configuration valide plutôt que de
+    planter ou d'appliquer un état incohérent)."""
+
+    global _config_file_mtime
+
+    new_config = load_config()  # valide déjà entièrement le nouveau fichier
+
+    changed_sections = []
+    for section in HOT_RELOADABLE_SECTIONS:
+        if Config.get(section) != new_config.get(section):
+            Config[section] = new_config[section]
+            changed_sections.append(section)
+
+    if _config_file_path is not None and _config_file_path.exists():
+        _config_file_mtime = _config_file_path.stat().st_mtime
+
+    return changed_sections

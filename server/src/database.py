@@ -273,6 +273,16 @@ def delete_oldest_messages(count: int) -> int:
         return cursor.rowcount
 
 
+def delete_all_messages() -> int:
+    """Purge totale — réservée au mode serveur temporaire arrivé en fin
+    de vie (voir `[temporary]` et retention.py). Un client ne peut
+    JAMAIS déclencher ceci : ce n'est pas exposé par l'API."""
+
+    with transaction() as connection:
+        cursor = connection.execute("DELETE FROM messages")
+        return cursor.rowcount
+
+
 # ============================================================
 # FICHIERS
 # ============================================================
@@ -305,6 +315,14 @@ def list_files_older_than(cutoff_timestamp: float) -> list[str]:
     rows = connection.execute(
         "SELECT file_id FROM files WHERE created_at < ?", (cutoff_timestamp,)
     ).fetchall()
+    return [row["file_id"] for row in rows]
+
+
+def list_all_files() -> list[str]:
+    """Réservée au mode serveur temporaire (voir `delete_all_messages`)."""
+
+    connection = _connection()
+    rows = connection.execute("SELECT file_id FROM files").fetchall()
     return [row["file_id"] for row in rows]
 
 
@@ -385,3 +403,15 @@ def list_rooms() -> list[dict]:
 def count_rooms() -> int:
     connection = _connection()
     return connection.execute("SELECT COUNT(*) AS n FROM rooms").fetchone()["n"]
+
+
+def set_room_password(name: str, password_hash: str | None) -> bool:
+    """Change (ou retire, si `password_hash` est None) le mot de passe
+    d'un salon SANS toucher à son historique de messages. Réservé aux
+    sessions admin côté serveur (voir main.py `/admin/rooms/...`)."""
+
+    with transaction() as connection:
+        cursor = connection.execute(
+            "UPDATE rooms SET password_hash = ? WHERE name = ?", (password_hash, name)
+        )
+        return cursor.rowcount > 0

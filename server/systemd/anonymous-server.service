@@ -8,6 +8,7 @@ Type=simple
 User=anonymous
 Group=anonymous
 ExecStart=/usr/bin/anonymous-server
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 Environment=ANONYMOUS_SERVER_CONFIG=/etc/anonymous/server.toml

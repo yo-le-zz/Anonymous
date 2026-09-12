@@ -20,8 +20,8 @@ import base64
 
 from pydantic import BaseModel, Field
 
-ALLOWED_TYPES = {"msg", "file", "kx"}
-ALLOWED_ALGORITHMS = {"AES-256-GCM", "ChaCha20-Poly1305"}
+ALLOWED_TYPES = {"msg", "file", "kx", "reaction"}
+ALLOWED_ALGORITHMS = {"AES-256-GCM", "ChaCha20-Poly1305", "none"}
 
 import re
 
@@ -109,3 +109,45 @@ class RoomCreateRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
+
+
+# ============================================================
+# ADMINISTRATION ÉPHÉMÈRE (voir docs/crypto.md "Administration sans
+# identité" et session.py)
+# ============================================================
+#
+# Toute action admin doit prouver la possession de la clé privée
+# Ed25519 de la session (même mécanisme anti-usurpation que pour les
+# messages, voir SignedEnvelopeIn), signée sur une chaîne canonique
+# propre à l'action pour éviter qu'une signature d'action admin soit
+# rejouée pour une autre action.
+
+def admin_canonical_bytes(*parts: str) -> bytes:
+    return "|".join(["admin", *parts]).encode("utf-8")
+
+
+class AdminClaimRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    signature: str = Field(min_length=1, max_length=256)
+    password: str | None = Field(default=None, max_length=1024)
+
+    def canonical_bytes(self) -> bytes:
+        return admin_canonical_bytes("claim")
+
+
+class AdminReloadRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    signature: str = Field(min_length=1, max_length=256)
+
+    def canonical_bytes(self) -> bytes:
+        return admin_canonical_bytes("reload")
+
+
+class AdminRoomPasswordRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    signature: str = Field(min_length=1, max_length=256)
+    room: str = Field(min_length=1, max_length=64)
+    password: str | None = Field(default=None, max_length=1024)
+
+    def canonical_bytes(self) -> bytes:
+        return admin_canonical_bytes("room-password", self.room, self.password or "")

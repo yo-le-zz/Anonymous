@@ -31,6 +31,16 @@ applicative permanente.
 - **Basse consommation** : SQLite, pas de Redis/Celery/PostgreSQL,
   une seule tâche périodique légère pour la rétention.
 - **Messages éphémères configurables** (par âge ou par quantité).
+- **Réactions et réponses** chiffrées, **pseudos locaux** avec couleur
+  (jamais envoyés au serveur), **indicateurs de frappe** en direct.
+- **Administration sans identité** : un rôle admin ponctuel (premier
+  arrivé ou mot de passe partagé), jamais exposé aux autres clients,
+  pour recharger la config ou gérer les salons — voir `docs/crypto.md`.
+- **Anti-spam progressif**, **page web publique** sans tracking
+  (`/`, `/status`, `/api/stats`), **serveur temporaire** auto-destructeur.
+- **Assistant de configuration visuel** (`anonymous-server config`) et
+  CLI classique (`--version`, `stats`, `check-config`...).
+- **Docker** (`docker compose up -d`) en plus du paquet `.deb`.
 - **Binaires officiels** pour Linux et Windows publiés automatiquement
   à chaque tag de version (voir `.github/workflows/release.yml`).
 
@@ -39,15 +49,21 @@ applicative permanente.
 ### Client
 
 ```bash
-sudo apt install ./anonymous_1.0.3_amd64.deb
+sudo apt install ./anonymous_1.0.4_amd64.deb
 anonymous
 ```
 
 ### Serveur
 
 ```bash
-sudo apt install ./anonymous-server_1.0.3_amd64.deb
+sudo apt install ./anonymous-server_1.0.4_amd64.deb
 sudo systemctl enable --now anonymous-server
+```
+
+Ou via Docker :
+
+```bash
+docker compose up -d
 ```
 
 Sous Windows, téléchargez `anonymous-windows-amd64.zip` /
@@ -109,10 +125,14 @@ secret lui-même, via un échange Diffie-Hellman X25519 :
 /connect URL [mot_de_passe]     se connecter à un serveur
 /disconnect                     se déconnecter
 /server                         état de connexion (serveur, salon, identité)
-/room new|join|use|list         gérer les salons
+/room new|join|use|list|password    gérer les salons
 /room exchange start|respond|finish   échange de secret par X25519
 /upload chemin                  envoyer un fichier chiffré
 /download id                    télécharger un fichier reçu
+/react id emoji                 réagir à un message
+/reply id texte                 répondre à un message
+/nick numéro nom [couleur]      pseudo local (jamais envoyé au serveur)
+/admin claim|reload|room-password   administration éphémère
 /quit                           quitter
 texte + Entrée                  envoyer un message
 ```
@@ -192,8 +212,8 @@ doit compiler sur l'OS cible).
   directement sur la page GitHub Release correspondante.
 
 ```bash
-git tag v1.0.3
-git push origin v1.0.3
+git tag v1.0.4
+git push origin v1.0.4
 ```
 
 ## Rotation des clés et rétention (aperçu)

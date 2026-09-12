@@ -46,6 +46,7 @@ class SessionInfo:
     public_key_bytes: bytes
     anonymous_number: int
     expires_at: float
+    is_admin: bool = False
 
 
 class SessionRegistry:
@@ -54,6 +55,12 @@ class SessionRegistry:
         self._sessions: dict[str, SessionInfo] = {}
         self._numbers_in_use: set[int] = set()
         self._lock = threading.Lock()
+        # Administration éphémère (voir docs/crypto.md "Administration
+        # sans identité") : uniquement en RAM, remis à zéro à chaque
+        # redémarrage. `_first_claim_used` implémente la règle "premier
+        # arrivé, premier servi" quand aucun mot de passe admin n'est
+        # configuré — voir `try_claim_admin_first`.
+        self._first_claim_used = False
 
     # -------------------- création --------------------
 
@@ -147,3 +154,44 @@ class SessionRegistry:
     def active_count(self) -> int:
         with self._lock:
             return len(self._sessions)
+
+    # -------------------- administration éphémère --------------------
+    #
+    # Voir docs/crypto.md "Administration sans identité". Le statut
+    # admin d'une session n'est JAMAIS exposé aux autres clients : ni
+    # dans les enveloppes publiques, ni dans /rooms, ni dans /status.
+    # Seule la session elle-même (via sa propre requête, prouvée par
+    # signature) peut connaître et utiliser son propre statut.
+
+    def mark_admin(self, session_id: str) -> bool:
+        with self._lock:
+            info = self._sessions.get(session_id)
+
+            if info is None or info.expires_at < time.time():
+                return False
+
+            info.is_admin = True
+            return True
+
+    def try_claim_admin_first(self, session_id: str) -> bool:
+        """Implémente la règle « pas de mot de passe admin configuré =
+        la première session qui le demande depuis le démarrage du
+        serveur devient admin ». Retourne False si une autre session a
+        déjà réclamé ce rôle avant, ou si `session_id` est inconnu."""
+
+        with self._lock:
+            info = self._sessions.get(session_id)
+
+            if info is None or info.expires_at < time.time():
+                return False
+
+            if self._first_claim_used:
+                return False
+
+            info.is_admin = True
+            self._first_claim_used = True
+            return True
+
+    def is_admin(self, session_id: str) -> bool:
+        info = self.get(session_id)
+        return bool(info and info.is_admin)

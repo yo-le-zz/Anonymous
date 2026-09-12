@@ -22,6 +22,7 @@ from crypto import (
     Room,
     RotationPolicy,
     SigningIdentity,
+    admin_canonical_bytes,
     b64d,
     b64e,
     canonical_envelope_bytes,
@@ -33,6 +34,7 @@ from framing import frame_chunks, unframe_stream
 from media import decrypt_file_chunks, encrypt_file_chunks, save_stream_to_path
 from protocol import (
     FileMetadataPayload,
+    ReactionPayload,
     TextPayload,
     build_ws_url,
     is_insecure,
@@ -67,6 +69,22 @@ pending_exchange: KeyExchangeState | None = None
 signing_identity: SigningIdentity | None = None
 session_id: str | None = None
 own_anonymous_number: int | None = None
+is_admin: bool = False  # jamais annoncé au serveur ni visible des autres
+
+# Pseudos + couleurs LOCAUX pour d'autres numéros "Anonymous #XXXXXX"
+# vus pendant la session en cours. JAMAIS envoyé au serveur, JAMAIS
+# persisté entre sessions : puisque le numéro change à chaque
+# connexion (voir docs/crypto.md), le conserver d'une session à
+# l'autre étiquetterait à tort une personne différente. C'est un
+# simple confort d'affichage local, valable seulement pour la
+# connexion en cours.
+local_nicknames: dict[int, tuple[str, str]] = {}  # numéro -> (nom, couleur)
+NICKNAME_COLORS = ("cyan", "green", "yellow", "magenta", "white", "red")
+
+# Signal (thread-safe) qu'un indicateur "en train d'écrire" doit être
+# envoyé au prochain passage de la boucle WebSocket — voir
+# input_loop() et websocket_listener_async().
+_typing_signal = threading.Event()
 
 ws_generation = 0  # incrémenté à chaque /connect ou /disconnect pour
                    # invalider proprement le thread WebSocket précédent
@@ -117,12 +135,15 @@ def http_headers() -> dict:
 def _format_display_name(anonymous_number, my_number) -> str:
     """Numéro pseudonyme de session, PAS un username (voir docs/crypto.md).
     Affiche "Vous / Anonymous #NNNNNN" pour les messages de la propre
-    session courante, "Anonymous #NNNNNN" sinon."""
+    session courante, "Anonymous #NNNNNN" sinon — sauf si un pseudo
+    LOCAL a été défini pour ce numéro (/nick), auquel cas il est
+    utilisé à la place, avec sa couleur (voir draw_chat)."""
 
     if anonymous_number is None:
         return "Anonymous #??????"
 
-    label = f"Anonymous #{anonymous_number:06d}"
+    nickname_entry = local_nicknames.get(anonymous_number)
+    label = nickname_entry[0] if nickname_entry else f"Anonymous #{anonymous_number:06d}"
 
     if my_number is not None and anonymous_number == my_number:
         return f"Vous / {label}"
@@ -172,9 +193,24 @@ def prepare_incoming(envelope_dict: dict) -> dict:
     if envelope.type == "msg":
         try:
             payload = TextPayload.decode(plaintext)
-            entry["content"] = payload.body
+            # `reply_to` est purement indicatif (voir protocol.py) :
+            # jamais vérifié, juste un confort d'affichage.
+            if payload.reply_to is not None:
+                entry["content"] = f"↳ (#{payload.reply_to}) {payload.body}"
+            else:
+                entry["content"] = payload.body
         except (json.JSONDecodeError, KeyError):
             entry["content"] = "[message chiffré indisponible]"
+            entry["unavailable"] = True
+        return entry
+
+    if envelope.type == "reaction":
+        try:
+            reaction = ReactionPayload.decode(plaintext)
+            entry["content"] = f"{reaction.emoji} en réaction à #{reaction.target_id}"
+            entry["is_reaction"] = True
+        except (json.JSONDecodeError, KeyError):
+            entry["content"] = "[réaction indisponible]"
             entry["unavailable"] = True
         return entry
 
@@ -229,7 +265,7 @@ def establish_session(base_url: str) -> None:
     cas, une IDENTITÉ VISUELLE NOUVELLE est obtenue, jamais l'ancienne
     restaurée."""
 
-    global signing_identity, session_id, own_anonymous_number
+    global signing_identity, session_id, own_anonymous_number, is_admin
 
     identity = SigningIdentity()
 
@@ -245,6 +281,7 @@ def establish_session(base_url: str) -> None:
     with state_lock:
         signing_identity = identity
         session_id = data["session_id"]
+        is_admin = False
         own_anonymous_number = data["anonymous_number"]
 
     show_system_message(f"Identité de session : Anonymous #{own_anonymous_number:06d}")
@@ -440,7 +477,7 @@ def handle_connect(args: list[str]) -> None:
 
 
 def handle_disconnect() -> None:
-    global server_url, auth_token, ws_generation, signing_identity, session_id, own_anonymous_number
+    global server_url, auth_token, ws_generation, signing_identity, session_id, own_anonymous_number, is_admin
 
     with state_lock:
         server_url = None
@@ -452,6 +489,7 @@ def handle_disconnect() -> None:
         signing_identity = None
         session_id = None
         own_anonymous_number = None
+        is_admin = False
 
     show_system_message("Déconnecté.")
 
@@ -922,14 +960,25 @@ async def websocket_listener_async(my_generation: int):
                         if ws_generation != my_generation:
                             return
 
+                    if _typing_signal.is_set():
+                        _typing_signal.clear()
+                        with state_lock:
+                            sid = session_id
+                        if sid is not None:
+                            try:
+                                await websocket.send(json.dumps({"type": "typing", "session_id": sid}))
+                            except Exception:
+                                pass
+
                     try:
-                        raw = await asyncio.wait_for(websocket.recv(), timeout=5)
+                        raw = await asyncio.wait_for(websocket.recv(), timeout=1)
                     except asyncio.TimeoutError:
                         # Pas de message reçu récemment : on boucle pour
                         # revérifier `ws_generation` (ex. changement de
-                        # salon via /room) sans jamais rester bloqué
-                        # indéfiniment dans un `recv()` qui ne reviendra
-                        # peut-être jamais tout seul.
+                        # salon via /room) et envoyer un éventuel signal
+                        # "en train d'écrire" en attente, sans jamais
+                        # rester bloqué indéfiniment dans un `recv()`
+                        # qui ne reviendra peut-être jamais tout seul.
                         continue
 
                     data = json.loads(raw)
@@ -940,6 +989,16 @@ async def websocket_listener_async(my_generation: int):
 
                         if screen is not None:
                             draw_chat(screen)
+
+                    elif data.get("type") == "typing_indicator":
+                        with state_lock:
+                            my_number = own_anonymous_number
+                        number = data.get("anonymous_number")
+                        if number is not None and number != my_number:
+                            name = _format_display_name(number, my_number)
+                            show_system_message(f"{name} est en train d'écrire...")
+                            if screen is not None:
+                                draw_chat(screen)
 
         except Exception as error:
             if not running:
@@ -1065,6 +1124,204 @@ def draw_chat(window, input_text=""):
 
 
 # ============================================================
+# PSEUDOS LOCAUX (/nick) — jamais envoyés au serveur
+# ============================================================
+
+def handle_nick(args: list[str]) -> None:
+    if not args:
+        if local_nicknames:
+            show_system_message("Pseudos locaux définis pour cette session :")
+            for number, (name, color) in local_nicknames.items():
+                show_system_message(f"  #{number:06d} -> {name} ({color})")
+        else:
+            show_system_message("Aucun pseudo local défini. Utilisation : /nick <numéro> <nom> [couleur]")
+        return
+
+    if len(args) < 2:
+        show_system_message("Utilisation : /nick <numéro> <nom> [couleur]")
+        show_system_message(f"Couleurs disponibles : {', '.join(NICKNAME_COLORS)}")
+        return
+
+    try:
+        number = int(args[0].lstrip("#"))
+    except ValueError:
+        show_system_message("Le numéro doit être celui affiché, ex: /nick 591679 Alice")
+        return
+
+    color = args[-1].lower() if len(args) > 2 and args[-1].lower() in NICKNAME_COLORS else "white"
+    name_parts = args[1:-1] if len(args) > 2 and args[-1].lower() in NICKNAME_COLORS else args[1:]
+    name = " ".join(name_parts)
+
+    local_nicknames[number] = (name, color)
+    show_system_message(
+        f"Pseudo local défini : #{number:06d} -> {name} ({color}). "
+        "Uniquement visible par vous, jamais envoyé au serveur, "
+        "et sans effet la prochaine session (le numéro change à chaque connexion)."
+    )
+
+
+# ============================================================
+# RÉACTIONS ET RÉPONSES (chiffrées, comme un message normal)
+# ============================================================
+
+def handle_react(args: list[str]) -> None:
+    if len(args) < 2:
+        show_system_message("Utilisation : /react <id_message> <emoji>")
+        return
+
+    with state_lock:
+        active_keyring = keyring
+        base_url = server_url
+
+    if base_url is None or active_keyring is None:
+        show_system_message("Aucun serveur/salon actif.")
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        show_system_message("L'id du message doit être un nombre (visible dans l'historique).")
+        return
+
+    from crypto import encrypt_message
+
+    payload = ReactionPayload(emoji=args[1], target_id=target_id)
+    envelope = encrypt_message(active_keyring, payload.encode(), envelope_type="reaction")
+
+    try:
+        response = post_signed_envelope(base_url, envelope)
+        add_local_message(prepare_incoming(response.json()))
+    except requests.HTTPError as error:
+        detail = error.response.text if error.response is not None else str(error)
+        show_system_message(f"Réaction refusée : {detail}")
+
+
+def handle_reply(args: list[str]) -> None:
+    if len(args) < 2:
+        show_system_message("Utilisation : /reply <id_message> <texte>")
+        return
+
+    with state_lock:
+        active_keyring = keyring
+        base_url = server_url
+
+    if base_url is None or active_keyring is None:
+        show_system_message("Aucun serveur/salon actif.")
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        show_system_message("L'id du message doit être un nombre (visible dans l'historique).")
+        return
+
+    from crypto import encrypt_message
+
+    text = " ".join(args[1:])
+    payload = TextPayload(body=text, reply_to=target_id)
+    envelope = encrypt_message(active_keyring, payload.encode())
+
+    try:
+        response = post_signed_envelope(base_url, envelope)
+        add_local_message(prepare_incoming(response.json()))
+    except requests.HTTPError as error:
+        detail = error.response.text if error.response is not None else str(error)
+        show_system_message(f"Réponse refusée : {detail}")
+
+
+# ============================================================
+# ADMINISTRATION ÉPHÉMÈRE (/admin) — voir docs/crypto.md
+# ============================================================
+
+def _admin_request(base_url: str, endpoint: str, extra_fields: dict, *canonical_parts: str) -> dict:
+    with state_lock:
+        sid = session_id
+        identity = signing_identity
+
+    if sid is None or identity is None:
+        raise RuntimeError("aucune session active — /connect d'abord.")
+
+    signature = identity.sign(admin_canonical_bytes(*canonical_parts))
+    body = {"session_id": sid, "signature": b64e(signature), **extra_fields}
+
+    response = requests.post(
+        f"{base_url}/{endpoint}",
+        json=body,
+        headers=http_headers(),
+        timeout=Config["network"]["connect_timeout_seconds"],
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def handle_admin(args: list[str]) -> None:
+    global is_admin
+
+    with state_lock:
+        base_url = server_url
+
+    if base_url is None:
+        show_system_message("Aucun serveur connecté.")
+        return
+
+    if not args:
+        show_system_message("Utilisation : /admin claim|reload|room-password [...]")
+        return
+
+    sub = args[0].lower()
+
+    if sub == "claim":
+        password = args[1] if len(args) > 1 else None
+        try:
+            _admin_request(base_url, "admin/claim", {"password": password}, "claim")
+            is_admin = True
+            show_system_message(
+                "Vous êtes désormais administrateur de ce serveur (le savoir "
+                "reste local à ce client : personne d'autre n'en est informé)."
+            )
+        except requests.HTTPError as error:
+            detail = error.response.text if error.response is not None else str(error)
+            show_system_message(f"Impossible de revendiquer le rôle admin : {detail}")
+        return
+
+    if sub == "reload":
+        try:
+            result = _admin_request(base_url, "admin/reload", {}, "reload")
+            sections = result.get("reloaded_sections", [])
+            show_system_message(
+                f"Configuration rechargée : {', '.join(sections) if sections else '(aucun changement)'}"
+            )
+        except requests.HTTPError as error:
+            detail = error.response.text if error.response is not None else str(error)
+            show_system_message(f"Rechargement refusé : {detail}")
+        return
+
+    if sub == "room-password":
+        if len(args) < 2:
+            show_system_message("Utilisation : /admin room-password <salon> [mot_de_passe]")
+            return
+
+        room_name = args[1]
+        password = args[2] if len(args) > 2 else None
+
+        try:
+            result = _admin_request(
+                base_url, "admin/rooms/password", {"room": room_name, "password": password},
+                "room-password", room_name, password or "",
+            )
+            show_system_message(
+                f"Salon '{room_name}' : mot de passe "
+                f"{'défini' if result['has_password'] else 'retiré'} (historique conservé)."
+            )
+        except requests.HTTPError as error:
+            detail = error.response.text if error.response is not None else str(error)
+            show_system_message(f"Action refusée : {detail}")
+        return
+
+    show_system_message(f"Sous-commande /admin inconnue : {sub}")
+
+
+# ============================================================
 # COMMANDES
 # ============================================================
 
@@ -1081,6 +1338,10 @@ def handle_command(command: str) -> bool:
         show_system_message("/room exchange start|respond|finish   échange X25519")
         show_system_message("/upload chemin            envoyer un fichier chiffré")
         show_system_message("/download id              télécharger un fichier reçu")
+        show_system_message("/react id emoji           réagir à un message")
+        show_system_message("/reply id texte           répondre à un message")
+        show_system_message("/nick numéro nom [couleur]  pseudo local (jamais envoyé)")
+        show_system_message("/admin claim|reload|room-password   administration éphémère")
         show_system_message("/quit                     quitter")
         show_system_message("texte + Entrée            envoyer un message")
         return False
@@ -1105,6 +1366,7 @@ def handle_command(command: str) -> bool:
                 "Identité de session : "
                 + (f"Anonymous #{own_anonymous_number:06d}" if own_anonymous_number else "(aucune)")
             )
+            show_system_message(f"Administrateur (local uniquement) : {'oui' if is_admin else 'non'}")
         return False
 
     if cmd == "/room":
@@ -1123,6 +1385,22 @@ def handle_command(command: str) -> bool:
             show_system_message("Utilisation : /download id_fichier")
         else:
             handle_download(args[0])
+        return False
+
+    if cmd == "/react":
+        handle_react(args)
+        return False
+
+    if cmd == "/reply":
+        handle_reply(args)
+        return False
+
+    if cmd == "/nick":
+        handle_nick(args)
+        return False
+
+    if cmd == "/admin":
+        handle_admin(args)
         return False
 
     if cmd.startswith("/"):
@@ -1172,7 +1450,14 @@ def input_loop(window):
             input_text = input_text[:-1]
 
         elif 32 <= key <= 126:
+            was_empty = not input_text
             input_text += chr(key)
+            if was_empty:
+                # Signal "en train d'écrire" — uniquement au début
+                # d'une saisie, pas à chaque touche (voir
+                # websocket_listener_async, qui l'envoie au prochain
+                # passage de sa boucle, sous 1 seconde).
+                _typing_signal.set()
 
 
 def run_chat(window):

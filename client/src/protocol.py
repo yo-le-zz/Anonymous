@@ -26,14 +26,44 @@ HTTP_SERVER_INFO_PATH = "/server-info"
 class TextPayload:
     kind: Literal["text"] = "text"
     body: str = ""
+    # Référence à un message existant (voir /reply). Purement
+    # indicative et *jamais* vérifiée par le serveur : il n'a pas le
+    # texte en clair, donc pas de moyen de vérifier que la référence
+    # est cohérente. Ce n'est qu'un confort d'affichage côté client
+    # (voir docs/crypto.md, "Fonctionnalités indicatives").
+    reply_to: int | None = None
 
     def encode(self) -> bytes:
-        return json.dumps({"kind": self.kind, "body": self.body}).encode("utf-8")
+        return json.dumps(
+            {"kind": self.kind, "body": self.body, "reply_to": self.reply_to}
+        ).encode("utf-8")
 
     @staticmethod
     def decode(data: bytes) -> "TextPayload":
         parsed = json.loads(data.decode("utf-8"))
-        return TextPayload(body=parsed.get("body", ""))
+        return TextPayload(body=parsed.get("body", ""), reply_to=parsed.get("reply_to"))
+
+
+@dataclasses.dataclass
+class ReactionPayload:
+    """Une réaction est un mini-message chiffré à part entière (type
+    d'enveloppe `reaction`), référençant l'id du message ciblé. Le
+    serveur voit le TYPE (pour appliquer `[features] reactions_enabled`)
+    mais jamais l'émoji ni la cible : les deux sont chiffrés."""
+
+    kind: Literal["reaction"] = "reaction"
+    emoji: str = ""
+    target_id: int = 0
+
+    def encode(self) -> bytes:
+        return json.dumps(
+            {"kind": self.kind, "emoji": self.emoji, "target_id": self.target_id}
+        ).encode("utf-8")
+
+    @staticmethod
+    def decode(data: bytes) -> "ReactionPayload":
+        parsed = json.loads(data.decode("utf-8"))
+        return ReactionPayload(emoji=parsed.get("emoji", ""), target_id=parsed.get("target_id", 0))
 
 
 @dataclasses.dataclass

@@ -456,6 +456,15 @@ def canonical_envelope_bytes(envelope: Envelope) -> bytes:
     ).encode("utf-8")
 
 
+def admin_canonical_bytes(*parts: str) -> bytes:
+    """Octets signés pour une action admin (voir docs/crypto.md
+    "Administration sans identité"). Doit rester identique, au
+    caractère près, à `admin_canonical_bytes` côté serveur
+    (server/src/protocol.py)."""
+
+    return "|".join(["admin", *parts]).encode("utf-8")
+
+
 def verify_signature_offline(public_key_bytes: bytes, message: bytes, signature: bytes) -> bool:
     """Utilitaire de test/diagnostic côté client : permet de vérifier
     localement qu'une signature produite par une `SigningIdentity` est

@@ -96,17 +96,21 @@ anonymous/
 │   └── storage.py       — stockage local des secrets (XDG, permissions)
 ├── server/
 │   ├── src/
-│   │   ├── main.py       — application FastAPI
-│   │   ├── config.py      — chargement/validation de server.toml
-│   │   ├── database.py     — accès SQLite (schéma minimal)
+│   │   ├── main.py       — application FastAPI + CLI (argparse)
+│   │   ├── config.py      — chargement/validation/rechargement à chaud de server.toml
+│   │   ├── config_wizard.py — assistant de configuration interactif (TUI)
+│   │   ├── database.py     — accès SQLite (schéma minimal, salons)
 │   │   ├── storage.py       — fichiers chiffrés (quotas, anti path-traversal)
-│   │   ├── retention.py      — suppression automatique (âge/quantité)
+│   │   ├── retention.py      — rétention, revérification config, serveur temporaire
+│   │   ├── moderation.py      — liste de mots bannis (mode e2ee=false uniquement)
 │   │   ├── auth.py            — mot de passe serveur (Argon2id) + jetons temporaires
-│   │   ├── session.py          — sessions éphémères de signature (RAM uniquement)
-│   │   ├── ratelimit.py         — limitation de débit en mémoire
+│   │   ├── session.py          — sessions éphémères de signature + admin (RAM uniquement)
+│   │   ├── ratelimit.py         — limitation de débit + cooldown progressif
 │   │   └── protocol.py           — validation des enveloppes (Pydantic)
 │   ├── systemd/anonymous-server.service
-│   └── debian/{postinst,prerm,postrm}
+│   ├── debian/{postinst,prerm,postrm}
+│   ├── Dockerfile
+│   └── docker-entrypoint.sh
 ├── docs/
 │   ├── crypto.md      — protocole cryptographique complet
 │   ├── privacy.md      — modèle de menace, justification des données
@@ -114,8 +118,9 @@ anonymous/
 │   ├── server.md         — installation/exploitation du serveur
 │   └── https.md           — reverse proxy (Caddy/Nginx/Traefik)
 ├── tests/
-├── .github/workflows/  — CI (tests) et release (build Linux + Windows, publication sur tag)
+├── .github/workflows/  — CI (tests) et release (build Linux + Windows + Docker, publication sur tag)
 ├── build.sh            — build Linux (Nuitka onefile + .deb via dpkg-deb)
+├── docker-compose.yml
 ├── pyproject.toml
 └── README.md
 ```

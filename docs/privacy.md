@@ -9,7 +9,17 @@ raisonnement sur les métadonnées.
 
 **Anonymous ne garantit pas l'anonymat réseau absolu.**
 
-Même avec l'architecture décrite ici :
+> ⚠ **Mode `[privacy] e2ee = false`** : si un administrateur active
+> explicitement ce mode (désactivé par défaut), **les messages ne
+> sont PAS chiffrés de bout en bout**. Le serveur reçoit le texte en
+> clair pour pouvoir appliquer une modération réelle
+> (`[moderation]`), et son administrateur peut donc potentiellement
+> lire les messages. Ce mode doit toujours être annoncé clairement
+> aux utilisateurs du serveur concerné (page d'accueil, README local).
+> Ne l'activez que si c'est un compromis que vos utilisateurs
+> connaissent et acceptent.
+
+Même avec l'architecture décrite ici (mode par défaut, `e2ee = true`) :
 
 - votre fournisseur d'accès, un réseau Wi-Fi public, ou toute
   personne en mesure d'observer le trafic réseau peut voir que vous

@@ -4,9 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Build manuel de test (aucune Release GitHub ne sera publiée sans tag)"
+        required: false
+        default: "test manuel"
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   # ============================================================
@@ -112,12 +119,48 @@ jobs:
           path: artifacts/*
 
   # ============================================================
+  # IMAGE DOCKER — publiée sur GitHub Container Registry (ghcr.io)
+  # ============================================================
+  build-docker:
+    name: Build & push Docker image
+    runs-on: ubuntu-latest
+    # Le build est vérifié sur chaque déclenchement (y compris manuel),
+    # mais on ne PUSH l'image que pour un vrai tag de version — un
+    # test manuel ne doit pas polluer le registre.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push on tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: |
+            ghcr.io/${{ github.repository }}/anonymous-server:latest
+            ghcr.io/${{ github.repository }}/anonymous-server:${{ github.ref_name }}
+
+  # ============================================================
   # PUBLICATION DE LA RELEASE GITHUB
   # ============================================================
   release:
     name: Publish GitHub Release
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
+    # Uniquement pour un vrai tag `v*` — un déclenchement manuel
+    # (workflow_dispatch) construit et teste tout, mais ne publie rien.
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:

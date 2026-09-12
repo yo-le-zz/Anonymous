@@ -217,3 +217,51 @@ def test_normalize_server_url_and_ws_conversion():
 
     assert protocol.is_insecure("http://host") is True
     assert protocol.is_insecure("https://host") is False
+
+
+def test_build_ws_url_includes_room_and_password():
+    url = protocol.build_ws_url("http://host:8000", room="general", room_password="secret")
+    assert url.startswith("ws://host:8000/ws?")
+    assert "room=general" in url
+    assert "room_password=secret" in url
+
+    # Sans mot de passe : le paramètre est absent, pas envoyé vide.
+    url_no_password = protocol.build_ws_url("http://host:8000", room="general")
+    assert "room_password" not in url_no_password
+
+
+def test_text_payload_reply_to_roundtrip():
+    payload = protocol.TextPayload(body="salut", reply_to=42)
+    decoded = protocol.TextPayload.decode(payload.encode())
+    assert decoded.body == "salut"
+    assert decoded.reply_to == 42
+
+    # Un message normal (sans réponse) garde reply_to = None.
+    plain = protocol.TextPayload(body="normal")
+    assert protocol.TextPayload.decode(plain.encode()).reply_to is None
+
+
+def test_reaction_payload_roundtrip():
+    payload = protocol.ReactionPayload(emoji="👍", target_id=7)
+    decoded = protocol.ReactionPayload.decode(payload.encode())
+    assert decoded.emoji == "👍"
+    assert decoded.target_id == 7
+
+
+def test_admin_canonical_bytes_deterministic_and_distinct():
+    assert crypto.admin_canonical_bytes("claim") == b"admin|claim"
+    assert crypto.admin_canonical_bytes("room-password", "general", "pw") == b"admin|room-password|general|pw"
+    # Deux actions différentes ne doivent jamais produire les mêmes
+    # octets signés (sinon une signature pourrait être rejouée pour
+    # une autre action).
+    assert crypto.admin_canonical_bytes("claim") != crypto.admin_canonical_bytes("reload")
+
+
+def test_signing_identity_signs_admin_action_verifiably():
+    identity = crypto.SigningIdentity()
+    message = crypto.admin_canonical_bytes("reload")
+    signature = identity.sign(message)
+    assert crypto.verify_signature_offline(identity.public_key_bytes(), message, signature)
+    # Une signature pour une action ne doit pas valider une autre action.
+    other_message = crypto.admin_canonical_bytes("claim")
+    assert not crypto.verify_signature_offline(identity.public_key_bytes(), other_message, signature)

@@ -87,3 +87,58 @@ class ConnectionCounter:
                 self._counts[key] -= 1
                 if self._counts[key] <= 0:
                     del self._counts[key]
+
+
+class ProgressiveCooldown:
+    """Cooldown exponentiel par clé (IP) après un dépassement de
+    limite : 1s, 2s, 4s, 8s... jusqu'à `max_seconds`, au lieu d'un
+    simple rejet fixe (voir docs/server.md "Anti-spam").
+
+    Purement en mémoire (RAM), jamais persisté, jamais journalisé avec
+    la clé en clair — voir docs/privacy.md pour le même principe déjà
+    appliqué aux compteurs de `SlidingWindowLimiter`."""
+
+    def __init__(self, max_seconds: float):
+        self.max_seconds = max_seconds
+        self._blocked_until: dict[str, float] = {}
+        self._next_penalty: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def remaining_seconds(self, key: str) -> float:
+        with self._lock:
+            until = self._blocked_until.get(key)
+            if until is None:
+                return 0.0
+            remaining = until - time.monotonic()
+            return remaining if remaining > 0 else 0.0
+
+    def register_violation(self, key: str) -> float:
+        """Enregistre un dépassement de limite pour `key` et retourne
+        la durée (secondes) du cooldown appliqué."""
+
+        with self._lock:
+            penalty = self._next_penalty.get(key, 1.0)
+            self._blocked_until[key] = time.monotonic() + penalty
+            self._next_penalty[key] = min(penalty * 2, self.max_seconds)
+            return penalty
+
+    def register_success(self, key: str) -> None:
+        """Une requête normale réduit progressivement la pénalité
+        mémorisée, pour qu'une IP redevenue calme ne reste pas punie
+        indéfiniment à cause d'un pic ponctuel ancien."""
+
+        with self._lock:
+            if key in self._next_penalty:
+                self._next_penalty[key] = max(1.0, self._next_penalty[key] / 2)
+
+    def sweep(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            stale = [
+                key
+                for key, until in self._blocked_until.items()
+                if until < now - self.max_seconds
+            ]
+            for key in stale:
+                self._blocked_until.pop(key, None)
+                self._next_penalty.pop(key, None)

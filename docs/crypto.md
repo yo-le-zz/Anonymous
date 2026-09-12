@@ -381,3 +381,82 @@ ou au redémarrage.
   `session.ttl_seconds`, ou disparaît immédiatement si le serveur
   redémarre entre-temps.
 
+---
+
+## 10. Administration sans identité
+
+Un serveur a parfois besoin d'un rôle privilégié (recharger la
+configuration, changer le mot de passe d'un salon...). Anonymous
+fournit ce rôle **sans jamais créer de compte** :
+
+- **Sans mot de passe admin configuré** (`[admin] password_hash` vide,
+  valeur par défaut) : la PREMIÈRE session qui appelle
+  `POST /admin/claim` depuis le démarrage du serveur devient admin.
+  Toute tentative suivante échoue (`403`) jusqu'au prochain
+  redémarrage.
+- **Avec un mot de passe admin configuré** : n'importe quelle session
+  qui le fournit devient admin — plusieurs sessions peuvent l'être
+  simultanément si le mot de passe est partagé, exactement comme le
+  mot de passe serveur global (`[auth]`).
+
+Comme pour les messages (§9), chaque action admin (`/admin/reload`,
+`/admin/rooms/password`) doit être signée avec la clé Ed25519 de la
+session, sur une chaîne canonique propre à l'action :
+
+```
+"admin|claim"
+"admin|reload"
+"admin|room-password|<salon>|<mot_de_passe_ou_vide>"
+```
+
+**Le statut admin n'est stocké qu'en RAM** (`session.py`, jamais
+SQLite) et **n'est jamais exposé** dans une réponse publique — ni
+`/rooms`, ni `/status`, ni `/api/stats`, ni les enveloppes diffusées.
+Un client qui devient admin le sait pour lui-même ; aucun autre
+participant, y compris le serveur lui-même dans ses réponses
+publiques, ne le révèle jamais. C'est une extension directe du
+principe déjà appliqué aux sessions (§9) : un privilège technique
+ponctuel, jamais une identité.
+
+## 11. Fonctionnalités appliquées vs. indicatives
+
+Anonymous distingue deux catégories de fonctionnalités optionnelles
+(`[features]` dans `server.toml`), selon que le serveur PEUT ou NE
+PEUT PAS techniquement les faire respecter :
+
+| Fonctionnalité | Le serveur peut-il l'appliquer ? | Pourquoi |
+|---|---|---|
+| Réactions (`reactions_enabled`) | **Oui** | Le `type` d'enveloppe (`"reaction"`) est visible sans déchiffrement — le serveur peut accepter/refuser selon la configuration. |
+| Indicateurs de frappe (`typing_indicators_enabled`) | **Oui** | Relayés en clair sur le canal WebSocket de contrôle (jamais stockés), le serveur peut simplement ne pas les relayer si désactivé. |
+| Réponses (`replies_enabled`) | **Non — indicatif seulement** | `reply_to` vit à l'intérieur du contenu chiffré (`TextPayload`). Le serveur ne peut ni le voir, ni l'empêcher. |
+| Échange de salon par X25519 (`room_exchange_enabled`) | **Non — indicatif seulement** | Mécanisme entièrement local aux clients (voir §3.2), le serveur n'y participe même pas. |
+
+Cette distinction est **toujours indiquée honnêtement** dans
+`/server-info` et cette documentation : Anonymous ne prétend jamais
+qu'un réglage indicatif est une garantie technique.
+
+## 12. Mode non-E2EE explicite (`[privacy] e2ee = false`)
+
+Par défaut, `e2ee = true` : le serveur ne reçoit et ne peut jamais
+recevoir de texte en clair, comme documenté dans tout ce fichier.
+
+Un administrateur peut explicitement désactiver cette garantie
+(`e2ee = false`) pour obtenir, en échange, une vraie modération
+côté serveur (`[moderation] banned_words_enabled`). Dans ce mode
+uniquement :
+
+- le champ `algorithm` de l'enveloppe peut valoir `"none"` (au lieu de
+  `AES-256-GCM`/`ChaCha20-Poly1305`) : `ciphertext` transporte alors
+  réellement le texte en clair du message ;
+- le serveur peut inspecter ce texte (recherche de mots bannis) avant
+  de l'accepter, et le rejette avec un message générique
+  (`"message rejected"`) sans jamais révéler quel mot a déclenché le
+  rejet ;
+- **si `e2ee = true` (défaut), `algorithm = "none"` est refusé** avec
+  une erreur explicite : ce mode ne peut jamais s'activer par
+  accident.
+
+Le README et la page d'accueil du serveur (`GET /`) affichent un
+avertissement clair quand ce mode est actif — voir docs/privacy.md
+pour la formulation exacte et pourquoi ce choix doit rester explicite
+et visible.

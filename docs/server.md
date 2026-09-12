@@ -3,7 +3,7 @@
 ## 1. Installation via le paquet `.deb`
 
 ```bash
-sudo apt install ./anonymous-server_1.0.3_amd64.deb
+sudo apt install ./anonymous-server_1.0.4_amd64.deb
 ```
 
 Ceci installe :
@@ -170,3 +170,114 @@ Pour exposer votre serveur sur un nom de domaine avec HTTPS, voir
 gérer TLS directement ; il écoute en HTTP local (`127.0.0.1:8000` par
 défaut) et laisse un reverse proxy (Caddy, Nginx, ou Traefik)
 s'occuper du certificat et de l'exposition publique.
+
+## 9. Ligne de commande complète
+
+```bash
+anonymous-server                              démarre le serveur (usage systemd normal)
+anonymous-server --version                    affiche la version et quitte
+anonymous-server --help                       aide complète
+anonymous-server --config /chemin/vers.toml   utilise ce fichier au lieu du défaut
+anonymous-server hash-password                 génère le hash Argon2id du mot de passe serveur
+anonymous-server generate-admin-password-hash  génère le hash Argon2id du mot de passe admin
+anonymous-server check-config                  valide server.toml et quitte (sans démarrer)
+anonymous-server stats                         affiche les statistiques agrégées et quitte
+anonymous-server cleanup                       exécute un passage de rétention immédiat et quitte
+anonymous-server reload                        envoie un signal de rechargement au serveur déjà lancé
+anonymous-server config                        assistant de configuration interactif (TUI)
+```
+
+`--version` et `check-config` fonctionnent même si `server.toml` est
+actuellement invalide (ils le signalent proprement au lieu de
+planter) — pratique pour diagnostiquer un déploiement cassé.
+
+### Assistant de configuration (`anonymous-server config`)
+
+Ouvre un écran interactif : flèches haut/bas pour naviguer, Entrée
+pour modifier un champ (avec sa description affichée en bas d'écran),
+`s` pour enregistrer, `q`/Échap pour quitter sans rien changer. Aucune
+navigation forcée : on peut revenir sur n'importe quel champ à tout
+moment avant d'enregistrer. Les réglages non montrés par l'assistant
+(cas avancés) ne sont jamais modifiés ni perdus.
+
+## 10. Rechargement à chaud et revérification automatique
+
+`server.toml` est revérifié automatiquement toutes les ~60 secondes
+par le serveur lui-même (piggyback sur la tâche de rétention, pas de
+worker supplémentaire) : si le fichier a changé sur disque, les
+sections sûres sont appliquées sans redémarrage —
+
+```
+messages, retention, files, rooms, ratelimit,
+features, privacy, moderation, web, logging
+```
+
+Tout le reste (`server`, `storage`, `session`, `auth`, `crypto`,
+`network`) nécessite un vrai redémarrage : les changer à chaud
+créerait un état incohérent (port déjà lié, base déjà ouverte, jetons
+déjà émis...).
+
+Trois façons équivalentes de forcer un rechargement immédiat sans
+attendre le prochain passage automatique :
+
+```bash
+sudo systemctl reload anonymous-server     # via systemd (ExecReload)
+anonymous-server reload                     # via le fichier PID local
+kill -HUP <pid>                              # signal direct
+```
+
+Une session admin peut aussi le déclencher à distance via
+`POST /admin/reload` (voir docs/crypto.md §10). Dans tous les cas, un
+fichier devenu invalide entre-temps est **ignoré** : l'ancienne
+configuration valide continue de tourner, avec un message clair dans
+les logs.
+
+## 11. Serveur temporaire
+
+Pour un chat jetable (durée de vie fixée à l'avance) :
+
+```toml
+[temporary]
+enabled = true
+lifetime_seconds = 3600   # 1 heure
+```
+
+À l'expiration, le serveur purge **tous** ses messages et fichiers
+puis s'éteint proprement. La vérification suit la même cadence que la
+rétention (~60 secondes) : la durée de vie réelle peut donc dépasser
+légèrement `lifetime_seconds` de quelques dizaines de secondes.
+
+## 12. Docker
+
+Alternative au paquet `.deb`, pour n'importe quel système :
+
+```bash
+docker compose up -d
+```
+
+ou manuellement :
+
+```bash
+docker build -f server/Dockerfile -t anonymous-server .
+docker run -p 8000:8000 -v anonymous-data:/data anonymous-server
+```
+
+Au premier lancement, une configuration par défaut est générée dans
+le volume (`/data/server.toml`, adaptée aux chemins du conteneur) si
+aucune n'existe déjà — modifiez-la puis redémarrez le conteneur
+(ou utilisez `anonymous-server reload` à l'intérieur du conteneur).
+Une image est publiée sur `ghcr.io` à chaque tag de version (voir
+`.github/workflows/release.yml`).
+
+## 13. Page web publique, statut et statistiques
+
+- `GET /` — page HTML publique (activable/désactivable et
+  personnalisable via `[web]`), aucune ressource externe, aucun
+  tracking.
+- `GET /status` — texte brut orienté supervision (version, salons, en
+  ligne, stockage, uptime) — jamais d'IP, de chemin filesystem, de PID
+  ou de variable d'environnement.
+- `GET /api/stats` — JSON agrégé (`online`, `rooms`, `messages`,
+  `storage_bytes`), jamais de liste d'identifiants individuels.
+- `GET /policy` — politique de modération publique, pour un filtrage
+  indicatif côté client (voir docs/crypto.md §11-12).

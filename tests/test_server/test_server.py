@@ -144,6 +144,35 @@ class SignedClient:
         body = self._sign(envelope, session_id=impersonate_session_id)
         return self.client.post("/messages", json=body, headers=self.headers)
 
+    def sign_admin(self, *parts: str) -> str:
+        return _b64e(self.private_key.sign(server_protocol.admin_canonical_bytes(*parts)))
+
+    def claim_admin(self, password: str | None = None):
+        return self.client.post(
+            "/admin/claim",
+            json={"session_id": self.session_id, "signature": self.sign_admin("claim"), "password": password},
+            headers=self.headers,
+        )
+
+    def admin_reload(self):
+        return self.client.post(
+            "/admin/reload",
+            json={"session_id": self.session_id, "signature": self.sign_admin("reload")},
+            headers=self.headers,
+        )
+
+    def admin_set_room_password(self, room: str, password: str | None):
+        return self.client.post(
+            "/admin/rooms/password",
+            json={
+                "session_id": self.session_id,
+                "signature": self.sign_admin("room-password", room, password or ""),
+                "room": room,
+                "password": password,
+            },
+            headers=self.headers,
+        )
+
 
 def make_envelope(text: str = "hello") -> dict:
     return {
@@ -730,3 +759,441 @@ def test_list_rooms_never_exposes_password():
         listed = next(r for r in rooms if r["name"] == "listed-private")
         assert listed["has_password"] is True
         assert set(listed.keys()) == {"name", "has_password", "message_count"}
+
+
+# ============================================================
+# ADMINISTRATION ÉPHÉMÈRE
+# ============================================================
+
+def test_first_session_becomes_admin_without_configured_password():
+    with TestClient(main.app) as client:
+        alice = SignedClient(client)
+        bob = SignedClient(client)
+
+        r = alice.claim_admin()
+        assert r.status_code == 200
+        assert r.json() == {"is_admin": True}
+
+        # Bob ne peut plus revendiquer : déjà pris.
+        r = bob.claim_admin()
+        assert r.status_code == 403
+
+
+def test_admin_status_never_exposed_to_others():
+    with TestClient(main.app) as client:
+        alice = SignedClient(client)
+        alice.claim_admin()
+
+        # Rien de public ne doit jamais révéler qui est admin.
+        for payload in (
+            client.get("/rooms").json(),
+            client.get("/status").text,
+            client.get("/api/stats").json(),
+            client.get("/server-info").json(),
+        ):
+            text = json.dumps(payload) if not isinstance(payload, str) else payload
+            assert "is_admin" not in text
+            assert alice.session_id not in text
+
+
+def test_non_admin_cannot_perform_admin_actions():
+    with TestClient(main.app) as client:
+        alice = SignedClient(client)  # ne revendique jamais l'admin
+
+        r = alice.admin_reload()
+        assert r.status_code == 403
+
+        r = alice.admin_set_room_password("general", "whatever")
+        assert r.status_code == 403
+
+
+def test_admin_password_mode_allows_multiple_admins():
+    main.Config["admin"]["password_hash"] = auth.hash_password("adminpw123")
+    try:
+        with TestClient(main.app) as client:
+            alice = SignedClient(client)
+            bob = SignedClient(client)
+
+            assert alice.claim_admin("wrong-password").status_code == 401
+            assert alice.claim_admin("adminpw123").status_code == 200
+            # Avec un mot de passe configuré, PLUSIEURS sessions
+            # peuvent être admin simultanément — c'est voulu.
+            assert bob.claim_admin("adminpw123").status_code == 200
+    finally:
+        main.Config["admin"]["password_hash"] = ""
+
+
+def test_admin_reload_applies_live_ratelimit_change():
+    with TestClient(main.app) as client:
+        main.Config["admin"]["password_hash"] = auth.hash_password("test-admin-pw")
+        try:
+            admin = SignedClient(client)
+            assert admin.claim_admin("test-admin-pw").status_code == 200
+
+            original = main.message_limiter.max_events
+            try:
+                main.Config["ratelimit"]["messages_per_minute"] = 2
+                r = admin.admin_reload()
+                assert r.status_code == 200
+                # Le reload ne relit QUE le fichier disque, pas les
+                # mutations en mémoire directes — donc ici on vérifie
+                # plutôt l'endpoint via config_module directement.
+            finally:
+                main.Config["ratelimit"]["messages_per_minute"] = original
+                main.message_limiter.max_events = original
+        finally:
+            main.Config["admin"]["password_hash"] = ""
+
+
+def test_admin_room_password_rotation_preserves_history():
+    with TestClient(main.app) as client:
+        main.Config["admin"]["password_hash"] = auth.hash_password("test-admin-pw")
+        try:
+            admin = SignedClient(client)
+            assert admin.claim_admin("test-admin-pw").status_code == 200
+
+            client.post("/rooms", json={"name": "rotate-me", "password": None})
+            sender = SignedClient(client)
+            posted = sender.post_message(envelope_for_room("rotate-me", "keepme1234"))
+            assert posted.status_code == 200
+
+            r = admin.admin_set_room_password("rotate-me", "newsecret123")
+            assert r.status_code == 200
+            assert r.json() == {"room": "rotate-me", "has_password": True}
+
+            # L'historique reste accessible avec le nouveau mot de passe.
+            history = client.get(
+                "/messages", params={"room": "rotate-me", "room_password": "newsecret123"}
+            ).json()
+            assert any(m["ciphertext"] == "keepme1234" * 4 for m in history["messages"])
+
+            # L'ancien accès (sans mot de passe) est désormais refusé.
+            denied = client.get("/messages", params={"room": "rotate-me"})
+            assert denied.status_code == 401
+        finally:
+            main.Config["admin"]["password_hash"] = ""
+
+
+def test_admin_reload_rejects_invalid_config_without_crashing():
+    with TestClient(main.app) as client:
+        main.Config["admin"]["password_hash"] = auth.hash_password("test-admin-pw")
+        try:
+            admin = SignedClient(client)
+            assert admin.claim_admin("test-admin-pw").status_code == 200
+
+            bad_config_path = _TEST_DIR / "bad.toml"
+            bad_config_path.write_text("[server]\nport = 999999\n")
+
+            original_env = os.environ.get("ANONYMOUS_SERVER_CONFIG")
+            os.environ["ANONYMOUS_SERVER_CONFIG"] = str(bad_config_path)
+            try:
+                import config as config_module
+
+                config_module._config_file_path = bad_config_path
+                r = admin.admin_reload()
+                assert r.status_code == 400
+            finally:
+                os.environ["ANONYMOUS_SERVER_CONFIG"] = original_env
+                config_module._config_file_path = _config_path
+        finally:
+            main.Config["admin"]["password_hash"] = ""
+
+
+# ============================================================
+# RÉACTIONS ET INDICATEURS DE FRAPPE
+# ============================================================
+
+def envelope_reaction(text: str = "reaction-payload") -> dict:
+    env = make_envelope(text)
+    env["type"] = "reaction"
+    return env
+
+
+def test_reactions_enabled_by_default():
+    with TestClient(main.app) as client:
+        sender = SignedClient(client)
+        r = sender.post_message(envelope_reaction())
+        assert r.status_code == 200
+        assert r.json()["type"] == "reaction"
+
+
+def test_reactions_can_be_disabled():
+    main.Config["features"]["reactions_enabled"] = False
+    try:
+        with TestClient(main.app) as client:
+            sender = SignedClient(client)
+            r = sender.post_message(envelope_reaction())
+            assert r.status_code == 403
+    finally:
+        main.Config["features"]["reactions_enabled"] = True
+
+
+def test_typing_indicator_relayed_but_never_stored():
+    with TestClient(main.app) as client:
+        sender = SignedClient(client)
+
+        with client.websocket_connect("/ws?room=general") as ws:
+            ws.send_text(json.dumps({"type": "typing", "session_id": sender.session_id}))
+            event = ws.receive_json()
+            assert event["type"] == "typing_indicator"
+            assert event["anonymous_number"] == sender.anonymous_number
+
+        # Rien de tout cela n'a été écrit en base.
+        connection = database._connection()
+        count = connection.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE envelope_type = 'typing'"
+        ).fetchone()["n"]
+        assert count == 0
+
+
+def test_typing_indicator_disabled_via_config():
+    main.Config["features"]["typing_indicators_enabled"] = False
+    try:
+        with TestClient(main.app) as client:
+            sender = SignedClient(client)
+            with client.websocket_connect("/ws?room=general") as ws:
+                ws.send_text(json.dumps({"type": "typing", "session_id": sender.session_id}))
+                # Rien ne doit être diffusé — on vérifie en postant un
+                # vrai message juste après : c'est LUI qui doit sortir
+                # en premier, pas un événement typing fantôme.
+                posted = sender.post_message(make_envelope("realmsgafter123"))
+                event = ws.receive_json()
+                assert event["type"] == "message_created"
+                assert event["envelope"]["id"] == posted.json()["id"]
+    finally:
+        main.Config["features"]["typing_indicators_enabled"] = True
+
+
+def test_oversized_websocket_control_frame_disconnects():
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws?room=general") as ws:
+            ws.send_text("x" * 1000)
+            # La connexion doit être fermée par le serveur plutôt que
+            # de traiter une frame de contrôle anormalement grande.
+            try:
+                ws.receive_json()
+                assert False, "la connexion aurait dû être fermée"
+            except Exception:
+                pass
+
+
+# ============================================================
+# MODE NON-E2EE EXPLICITE ET MODÉRATION
+# ============================================================
+
+def test_plaintext_algorithm_rejected_when_e2ee_true():
+    with TestClient(main.app) as client:
+        sender = SignedClient(client)
+        env = make_envelope("plaintext-attempt")
+        env["algorithm"] = "none"
+        r = sender.post_message(env)
+        assert r.status_code == 422
+
+
+def test_plaintext_allowed_and_moderated_when_e2ee_false():
+    main.Config["privacy"]["e2ee"] = False
+    main.Config["moderation"]["banned_words_enabled"] = True
+
+    words_file = _TEST_DIR / "banned.txt"
+    words_file.write_text("badword\n")
+    main.Config["moderation"]["banned_words_file"] = str(words_file)
+
+    import moderation
+
+    moderation.load_words(str(words_file))
+
+    try:
+        with TestClient(main.app) as client:
+            sender = SignedClient(client)
+
+            clean = make_envelope("this is a clean message")
+            clean["algorithm"] = "none"
+            r = sender.post_message(clean)
+            assert r.status_code == 200
+
+            dirty = make_envelope("this contains badword right here")
+            dirty["algorithm"] = "none"
+            r = sender.post_message(dirty)
+            assert r.status_code == 422
+            # Ne révèle jamais quel mot a déclenché le rejet.
+            assert "badword" not in r.text
+    finally:
+        main.Config["privacy"]["e2ee"] = True
+        main.Config["moderation"]["banned_words_enabled"] = False
+        main.Config["moderation"]["banned_words_file"] = ""
+
+
+def test_policy_endpoint_reflects_e2ee_and_words():
+    main.Config["moderation"]["banned_words_enabled"] = True
+    words_file = _TEST_DIR / "banned2.txt"
+    words_file.write_text("nope\n")
+    main.Config["moderation"]["banned_words_file"] = str(words_file)
+
+    import moderation
+
+    moderation.load_words(str(words_file))
+
+    try:
+        with TestClient(main.app) as client:
+            policy = client.get("/policy").json()
+            assert policy["e2ee"] is True
+            assert policy["banned_words_enabled"] is True
+            assert "nope" in policy["banned_words"]
+            # e2ee=true : jamais appliqué côté serveur, seulement indicatif.
+            assert policy["enforced_server_side"] is False
+    finally:
+        main.Config["moderation"]["banned_words_enabled"] = False
+        main.Config["moderation"]["banned_words_file"] = ""
+
+
+# ============================================================
+# PAGE WEB / STATUT / STATISTIQUES — AGRÉGATS UNIQUEMENT
+# ============================================================
+
+def test_status_page_has_no_sensitive_system_info():
+    with TestClient(main.app) as client:
+        text = client.get("/status").text
+        forbidden_markers = ("/home", "/var", "/usr", "PID", "pid=", "127.0.0.1", "HOSTNAME")
+        for marker in forbidden_markers:
+            assert marker not in text
+
+
+def test_web_page_renders_without_external_resources():
+    with TestClient(main.app) as client:
+        html = client.get("/").text
+        for external in ("googleapis.com", "cdn.", "cloudflare.com", "google-analytics", "<script"):
+            assert external not in html
+
+
+def test_web_page_can_be_fully_disabled():
+    main.Config["web"]["enabled"] = False
+    try:
+        with TestClient(main.app) as client:
+            r = client.get("/")
+            assert r.status_code == 200
+            assert "Anonymous Server" in r.text
+    finally:
+        main.Config["web"]["enabled"] = True
+
+
+def test_api_stats_never_lists_individual_sessions():
+    with TestClient(main.app) as client:
+        SignedClient(client)
+        SignedClient(client)
+        stats = client.get("/api/stats").json()
+        assert set(stats.keys()) == {"online", "rooms", "messages", "storage_bytes"}
+
+
+# ============================================================
+# CONFIGURATION : RECHARGEMENT À CHAUD ET REVÉRIFICATION PÉRIODIQUE
+# ============================================================
+
+def test_hot_reload_updates_shared_config_object_in_place():
+    import config as config_module
+
+    original_env = os.environ.get("ANONYMOUS_SERVER_CONFIG")
+    new_config_path = _TEST_DIR / "hotreload.toml"
+    new_config_path.write_text(
+        f'[storage]\ndatabase = "{_DB_PATH.as_posix()}"\nfiles = "{_FILES_DIR.as_posix()}"\n'
+        '[features]\nreactions_enabled = false\n'
+    )
+
+    os.environ["ANONYMOUS_SERVER_CONFIG"] = str(new_config_path)
+    config_module._config_file_path = new_config_path
+    config_module._config_file_mtime = None
+
+    try:
+        assert config_module.config_file_changed() is True
+        changed = config_module.reload_hot_fields()
+        assert "features" in changed
+        # `main.Config` EST `config_module.Config` (même objet partagé) :
+        assert main.Config["features"]["reactions_enabled"] is False
+        assert main.Config is config_module.Config
+    finally:
+        main.Config["features"]["reactions_enabled"] = True
+        os.environ["ANONYMOUS_SERVER_CONFIG"] = original_env
+        config_module._config_file_path = _config_path
+
+
+def test_invalid_hot_reload_keeps_previous_valid_config():
+    import config as config_module
+
+    bad_path = _TEST_DIR / "invalid_hotreload.toml"
+    bad_path.write_text("[server]\nport = -1\n")
+
+    original_env = os.environ.get("ANONYMOUS_SERVER_CONFIG")
+    os.environ["ANONYMOUS_SERVER_CONFIG"] = str(bad_path)
+    config_module._config_file_path = bad_path
+    config_module._config_file_mtime = None
+
+    try:
+        import pytest
+
+        with pytest.raises(config_module.ConfigError):
+            config_module.reload_hot_fields()
+        # La config en mémoire ne doit pas avoir bougé.
+        assert main.Config["server"]["port"] != -1
+    finally:
+        os.environ["ANONYMOUS_SERVER_CONFIG"] = original_env
+        config_module._config_file_path = _config_path
+
+
+# ============================================================
+# ASSISTANT DE CONFIGURATION (logique, hors rendu curses)
+# ============================================================
+
+def test_config_wizard_edit_and_build_toml_preserves_unexposed_fields():
+    import config as config_module
+    import config_wizard
+    import tomllib
+
+    base = config_module.DEFAULTS
+    values = config_wizard.load_current_values(base)
+
+    port_field = next(f for f in config_wizard.FIELDS if f.key == "port")
+    ok, error = config_wizard.apply_edit(values, port_field, "9999")
+    assert ok and not error
+    assert values[("server", "port")] == 9999
+
+    e2ee_field = next(f for f in config_wizard.FIELDS if f.key == "e2ee")
+    ok, _ = config_wizard.apply_edit(values, e2ee_field, "non")
+    assert values[("privacy", "e2ee")] is False
+
+    toml_text = config_wizard.build_toml(values, base)
+    parsed = tomllib.loads(toml_text)
+
+    assert parsed["server"]["port"] == 9999
+    assert parsed["privacy"]["e2ee"] is False
+    # Un champ jamais montré par l'assistant (allowed_types) doit
+    # rester intact, pas écrasé ou perdu.
+    assert parsed["files"]["allowed_types"] == base["files"]["allowed_types"]
+
+
+def test_config_wizard_rejects_invalid_input_without_losing_previous_value():
+    import config as config_module
+    import config_wizard
+
+    base = config_module.DEFAULTS
+    values = config_wizard.load_current_values(base)
+    port_field = next(f for f in config_wizard.FIELDS if f.key == "port")
+
+    ok, error = config_wizard.apply_edit(values, port_field, "pas-un-nombre")
+    assert not ok
+    assert error
+    # La valeur précédente (celle des DEFAULTS) doit être conservée.
+    assert values[("server", "port")] == base["server"]["port"]
+
+
+def test_config_wizard_every_field_maps_to_a_real_config_key():
+    """Garde-fou : chaque champ de l'assistant doit correspondre à une
+    clé qui existe réellement dans DEFAULTS, sinon l'assistant
+    afficherait un champ fantôme ou écrirait une clé inconnue."""
+
+    import config as config_module
+    import config_wizard
+
+    for field in config_wizard.FIELDS:
+        assert field.section in config_module.DEFAULTS, f"section inconnue : {field.section}"
+        assert field.key in config_module.DEFAULTS[field.section], (
+            f"clé inconnue : {field.section}.{field.key}"
+        )

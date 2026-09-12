@@ -1,6 +1,6 @@
 [project]
 name = "anonymous"
-version = "1.0.3"
+version = "1.0.4"
 description = "Chat chiffré de bout en bout, décentralisé, sans compte ni identité persistante"
 readme = "README.md"
 requires-python = ">=3.11"

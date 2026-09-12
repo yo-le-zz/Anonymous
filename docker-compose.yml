@@ -1,0 +1,28 @@
+# docker-compose.yml — lance un serveur Anonymous en une commande.
+#
+#   docker compose up -d
+#
+# Les données (base SQLite + fichiers chiffrés + server.toml généré
+# au premier lancement) vivent dans le volume nommé `anonymous-data`,
+# persistant entre les redémarrages du conteneur.
+
+services:
+  anonymous-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: anonymous-server:latest
+    container_name: anonymous-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - anonymous-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  anonymous-data:

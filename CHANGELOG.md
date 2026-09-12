@@ -3,6 +3,77 @@
 Toutes les modifications notables de ce projet sont documentées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.0.4] — 2026-09-11
+
+### Ajouté
+- **Réactions** (`/react <id> <emoji>`) et **réponses** (`/reply <id> <texte>`),
+  chiffrées de bout en bout comme n'importe quel message. Les
+  réactions sont réellement activables/désactivables côté serveur
+  (`[features] reactions_enabled`, le type d'enveloppe étant visible
+  sans déchiffrement) ; les réponses sont indicatives (le contenu
+  chiffré n'est jamais inspectable par le serveur).
+- **Pseudos et couleurs locaux** (`/nick <numéro> <nom> [couleur]`) :
+  jamais envoyés au serveur, jamais persistés d'une session à l'autre
+  (le numéro change à chaque connexion — les persister tromperait sur
+  l'identité réelle derrière un numéro futur).
+- **Administration éphémère sans identité** (`[admin]`, voir
+  docs/crypto.md) : la première session qui le demande devient admin
+  si aucun mot de passe admin n'est configuré, sinon quiconque connaît
+  ce mot de passe le devient. Le statut n'est **jamais** exposé aux
+  autres clients. Commandes client `/admin claim|reload|room-password`,
+  endpoints serveur `/admin/claim`, `/admin/reload`,
+  `/admin/rooms/password` (rotation de mot de passe de salon sans
+  perte d'historique), tous protégés par signature Ed25519.
+- **Anti-spam progressif** (`[ratelimit] progressive_cooldown_enabled`) :
+  cooldown qui double à chaque récidive (1s, 2s, 4s...) au lieu d'un
+  rejet fixe, avec en-tête `Retry-After`. Toujours annoncé via
+  `/server-info`.
+- **Mode `[privacy] e2ee = false`** explicite (désactivé par défaut) :
+  seul mode où une modération par mots bannis (`[moderation]`) est
+  réellement appliquée côté serveur. En E2EE (mode par défaut), la
+  même liste n'est publiée que via `GET /policy`, à titre indicatif
+  pour un filtrage côté client — jamais une garantie.
+- **Page web publique** (`/`), `/status`, `/api/stats`, `/policy` —
+  zéro ressource externe, zéro tracking, agrégats uniquement.
+- **Indicateurs de frappe** en direct (WebSocket), jamais stockés.
+- **Rechargement à chaud réel** : `server.toml` est revérifié
+  automatiquement toutes les ~60 secondes (et via `SIGHUP` /
+  `systemctl reload` / `anonymous-server reload` / `/admin/reload`) ;
+  les sections sûres (limites, fonctionnalités, modération, salons,
+  page web, rétention) sont appliquées sans redémarrage. Un fichier
+  devenu invalide entre-temps est ignoré (l'ancienne configuration
+  valide continue de tourner) plutôt que de casser le serveur.
+- **CLI classique** : `anonymous-server --version`, `--help`,
+  `--config PATH`, et sous-commandes `hash-password`,
+  `generate-admin-password-hash`, `check-config`, `stats`, `cleanup`,
+  `reload`, `config` (assistant interactif).
+- **Assistant de configuration visuel** (`anonymous-server config`) :
+  navigation au clavier, explication de chaque option et de sa valeur
+  actuelle, retour arrière libre, écriture du `server.toml` résultant.
+- **Mode serveur temporaire** (`[temporary]`) : purge totale des
+  messages/fichiers puis extinction automatique après une durée fixée.
+- **Docker** : `server/Dockerfile` + `docker-compose.yml`, image
+  publiée sur `ghcr.io` à chaque tag de version.
+- **Build multiplateforme** : le workflow de release construit et
+  teste désormais aussi sur déclenchement manuel
+  (`workflow_dispatch`), sans publier de Release GitHub hors tag.
+
+### Corrigé
+- **`config.py` ne doit plus jamais crasher à l'import** sur un
+  fichier invalide : `anonymous-server --version`/`check-config`
+  fonctionnent maintenant même avec une configuration cassée (avant,
+  ils plantaient avec une trace Python brute).
+- **`add_signal_handler(SIGHUP)` faisait planter le serveur** quand la
+  boucle asyncio ne tournait pas dans le thread principal (observé en
+  testant — `RuntimeError: set_wakeup_fd only works in main thread`).
+  Le rechargement par signal se dégrade proprement dans ce cas (reste
+  disponible via `/admin/reload` et la revérification périodique).
+- **Rechargement à chaud sans effet réel sur les limites de débit** :
+  les objets de limitation de débit étaient construits une fois au
+  démarrage et ne relisaient jamais `Config` — `[ratelimit]` modifié à
+  chaud n'avait donc aucun effet avant redémarrage. Corrigé
+  (`_apply_ratelimit_config`, appelée après chaque rechargement).
+
 ## [1.0.3] — 2026-09-08
 
 ### Corrigé
