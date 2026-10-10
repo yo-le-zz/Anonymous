@@ -26,6 +26,14 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
   (tant que le nom de la commande est encore en cours de frappe).
 
 ### Corrigé (suite)
+- **Suite CI Windows en échec** (`test_downloads_dir_points_to_home_downloads`) :
+  le test simulait un dossier personnel isolé via la variable
+  d'environnement `HOME`, qui n'est lue par `Path.home()` que sur
+  Linux/macOS — sur Windows, pathlib utilise `USERPROFILE` à la place.
+  Le test touchait donc le VRAI dossier Downloads de la machine CI au
+  lieu du dossier temporaire isolé. Corrigé en patchant directement
+  `Path.home()`, identique quel que soit l'OS. (`downloads_dir`
+  lui-même était déjà correct — seul le test ne portait pas.)
 - **Impossible de valider un chemin de destination personnalisé au
   téléchargement d'un fichier** : même bug qu'Entrée dans la boucle de
   saisie principale (corrigé en 1.0.6), mais dans le prompt de

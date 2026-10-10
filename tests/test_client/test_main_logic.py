@@ -454,7 +454,14 @@ def test_downloads_dir_points_to_home_downloads(monkeypatch, tmp_path):
     # revanche déjà le bon objet, résolu correctement à la collecte de
     # CE fichier — on réutilise directement sa classe.
     ClientStore = type(client_main.store)
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # `HOME` n'est lu par `Path.home()` que sur Linux/macOS — sur
+    # Windows, pathlib utilise `USERPROFILE`/`HOMEDRIVE`+`HOMEPATH` à
+    # la place, donc monkeypatcher la variable d'environnement ne
+    # fonctionne pas sur les deux plateformes (régression réelle vue
+    # en CI Windows : le test touchait le VRAI dossier Downloads de
+    # l'utilisateur au lieu du `tmp_path` isolé). On patche directement
+    # `Path.home()`, identique quel que soit l'OS.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     store = ClientStore(base_dir=tmp_path / "appdata")
     result = store.downloads_dir
