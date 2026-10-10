@@ -194,6 +194,21 @@ class ClientStore:
 
     @property
     def downloads_dir(self) -> Path:
-        path = self.base_dir / "downloads"
-        _ensure_dir(path)
-        return path
+        # VRAI dossier Téléchargements de l'utilisateur, pas un
+        # sous-dossier caché de `base_dir` (XDG data home) — celui-ci
+        # n'est jamais ce que quelqu'un attend comme destination par
+        # défaut, et était un vrai bug (fichiers "introuvables" après
+        # téléchargement). `~/Downloads` est la convention sur Windows
+        # ET sur Linux/macOS (pas besoin de distinguer les plateformes).
+        # Si ce dossier n'existe pas pour une raison quelconque, on
+        # retombe sur le dossier personnel plutôt que de créer un
+        # `Downloads` surprise là où l'utilisateur n'en a pas.
+        downloads = Path.home() / "Downloads"
+        if downloads.is_dir():
+            return downloads
+
+        try:
+            downloads.mkdir(parents=True, exist_ok=True)
+            return downloads
+        except OSError:
+            return Path.home()

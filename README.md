@@ -49,14 +49,14 @@ applicative permanente.
 ### Client
 
 ```bash
-sudo apt install ./anonymous_1.0.4_amd64.deb
+sudo apt install ./anonymous_1.0.7_amd64.deb
 anonymous
 ```
 
 ### Serveur
 
 ```bash
-sudo apt install ./anonymous-server_1.0.4_amd64.deb
+sudo apt install ./anonymous-server_1.0.7_amd64.deb
 sudo systemctl enable --now anonymous-server
 ```
 
@@ -125,17 +125,23 @@ secret lui-même, via un échange Diffie-Hellman X25519 :
 /connect URL [mot_de_passe]     se connecter à un serveur
 /disconnect                     se déconnecter
 /server                         état de connexion (serveur, salon, identité)
-/room new|join|use|list|password    gérer les salons
+/join salon [mot_de_passe]      rejoindre/créer un salon simple (voir docs/crypto.md §13)
+/room new|join|use|list|password    salons avancés, confidentialité garantie même contre le serveur
 /room exchange start|respond|finish   échange de secret par X25519
 /upload chemin                  envoyer un fichier chiffré
-/download id                    télécharger un fichier reçu
-/react id emoji                 réagir à un message
-/reply id texte                 répondre à un message
+/download [id]                  télécharger un fichier (dernier reçu par défaut, avec aperçu)
+/react [numéro|emoji] [id]      réagir (menu si aucun argument, dernier message par défaut)
+/reply [id] texte               répondre (dernier message par défaut)
 /nick numéro nom [couleur]      pseudo local (jamais envoyé au serveur)
 /admin claim|reload|room-password   administration éphémère
 /quit                           quitter
 texte + Entrée                  envoyer un message
 ```
+
+Dès que la saisie commence par `/`, les commandes correspondantes
+s'affichent avec leur gabarit d'arguments juste au-dessus de la zone
+de texte. Un indicateur "en train d'écrire" (façon Discord) apparaît
+au même endroit quand d'autres participants rédigent un message.
 
 Aucune commande `/edit` ni `/delete` : un message envoyé est
 immuable ; seule la rétention automatique configurée par
@@ -198,8 +204,16 @@ un outil tiers de packaging : Nuitka compile les binaires, `dpkg-deb`
 assemble les `.deb` directement.
 
 Pour Windows, les exécutables `.exe` sont produits par
-`.github/workflows/release.yml` sur un runner Windows natif (Nuitka
-doit compiler sur l'OS cible).
+`.github/workflows/release.yml` sur un runner Windows natif : Nuitka
+ne supporte pas la compilation croisée au sens strict (il compile
+pour l'OS sur lequel il tourne), donc produire un vrai `.exe` demande
+un vrai Windows — un runner GitHub Actions dans ce cas, sans jamais
+avoir besoin de posséder une machine Windows soi-même. Un essai de
+cross-compilation via Wine existe (`./build-windows-cross.sh`),
+volontairement documenté comme expérimental/best-effort dans son
+en-tête : c'est la seule vraie option pour "compiler pour Windows
+depuis Linux", mais elle reste moins fiable que la compilation
+native — n'en dépendez pas pour une release officielle.
 
 ## Intégration continue et releases
 
@@ -212,8 +226,8 @@ doit compiler sur l'OS cible).
   directement sur la page GitHub Release correspondante.
 
 ```bash
-git tag v1.0.4
-git push origin v1.0.4
+git tag v1.0.7
+git push origin v1.0.7
 ```
 
 ## Rotation des clés et rétention (aperçu)

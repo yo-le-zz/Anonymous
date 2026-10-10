@@ -201,14 +201,52 @@ def test_create_and_fetch_message():
 
         assert set(body.keys()) == {
             "id", "protocol_version", "type", "algorithm", "key_id", "nonce",
-            "ciphertext", "created_at", "anonymous_number", "room",
+            "ciphertext", "created_at", "anonymous_number", "room", "room_seq",
         }
         assert body["anonymous_number"] == sender.anonymous_number
+        assert body["room_seq"] == 1
         for forbidden in FORBIDDEN_COLUMNS:
             assert forbidden not in body
 
+
+def test_room_seq_increments_per_room_independently():
+    with TestClient(main.app) as client:
+        sender = SignedClient(client)
+
+        env_a1 = make_envelope("roomseqA00001"); env_a1["room"] = "alpha"
+        env_b1 = make_envelope("roomseqB00001"); env_b1["room"] = "beta"
+        env_a2 = make_envelope("roomseqA00002"); env_a2["room"] = "alpha"
+        env_b2 = make_envelope("roomseqB00002"); env_b2["room"] = "beta"
+
+        a1 = sender.post_message(env_a1).json()
+        b1 = sender.post_message(env_b1).json()
+        a2 = sender.post_message(env_a2).json()
+        b2 = sender.post_message(env_b2).json()
+
+        assert (a1["room_seq"], a2["room_seq"]) == (1, 2)
+        assert (b1["room_seq"], b2["room_seq"]) == (1, 2)
+
+
+def test_reactions_never_consume_a_room_seq():
+    with TestClient(main.app) as client:
+        sender = SignedClient(client)
+
+        msg = sender.post_message(make_envelope("reactseqtarget")).json()
+        base_seq = msg["room_seq"]
+        assert isinstance(base_seq, int)
+
+        reaction_envelope = make_envelope("reactseqpayload")
+        reaction_envelope["type"] = "reaction"
+        reaction = sender.post_message(reaction_envelope).json()
+        assert reaction["room_seq"] is None
+
+        next_msg = sender.post_message(make_envelope("reactseqnextone")).json()
+        # La réaction insérée entre les deux n'a pas consommé de numéro :
+        # le prochain message reste base_seq+1, pas +2.
+        assert next_msg["room_seq"] == base_seq + 1
+
         history = client.get("/messages").json()["messages"]
-        assert any(m["id"] == body["id"] for m in history)
+        assert any(m["id"] == next_msg["id"] for m in history)
 
 
 def test_broadcast_over_websocket():
@@ -414,6 +452,11 @@ def test_migration_adds_missing_columns_to_preexisting_database(tmp_path):
         "ciphertext, size_bytes, created_at, anonymous_number) "
         "VALUES ('msg', 1, 'AES-256-GCM', 'k.0', 'n', 'preexisting-ciphertext', 1, 123.0, 555555)"
     )
+    conn.execute(
+        "INSERT INTO messages (envelope_type, protocol_version, algorithm, key_id, nonce, "
+        "ciphertext, size_bytes, created_at, anonymous_number) "
+        "VALUES ('msg', 1, 'AES-256-GCM', 'k.0', 'n', 'preexisting-second', 1, 124.0, 555555)"
+    )
     conn.commit()
     conn.close()
 
@@ -427,19 +470,35 @@ def test_migration_adds_missing_columns_to_preexisting_database(tmp_path):
     database.init_database()  # ne doit PAS lever d'exception
 
     messages = database.get_messages(10)
-    assert len(messages) == 1
+    assert len(messages) == 2
     assert messages[0]["ciphertext"] == "preexisting-ciphertext"
     assert messages[0]["anonymous_number"] == 555555
     # Le message pré-existant retombe dans le salon par défaut.
     assert messages[0]["room"] == "general"
+    # Rétro-remplissage : les deux anciennes lignes (créées avant même
+    # l'existence de `room_seq`) sont numérotées dans leur salon, dans
+    # l'ordre d'insertion (id croissant) — exactement comme si elles
+    # avaient été envoyées après l'introduction de la fonctionnalité.
+    assert messages[0]["room_seq"] == 1
+    assert messages[1]["room_seq"] == 2
 
-    # Un nouveau message peut désormais être inséré normalement.
+    # Un nouveau message peut désormais être inséré normalement, et
+    # poursuit la numérotation là où le rétro-remplissage s'est arrêté.
     new_message = database.create_message(
         envelope_type="msg", protocol_version=1, algorithm="AES-256-GCM",
         key_id="k.1", nonce="n2", ciphertext="new-message", anonymous_number=111111,
         room="general",
     )
     assert new_message["room"] == "general"
+    assert new_message["room_seq"] == 3
+
+    # Une réaction insérée après coup ne consomme toujours aucun numéro.
+    reaction = database.create_message(
+        envelope_type="reaction", protocol_version=1, algorithm="AES-256-GCM",
+        key_id="k.2", nonce="n3", ciphertext="react", anonymous_number=111111,
+        room="general",
+    )
+    assert reaction["room_seq"] is None
 
     # Reconnecte la base de test normale pour la suite de la suite.
     database._local.connection.close()

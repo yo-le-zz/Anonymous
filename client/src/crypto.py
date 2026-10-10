@@ -73,6 +73,7 @@ KEY_SIZE = 32
 _HKDF_ROOM_INFO = b"anonymous-chat-v1|room-secret"
 _HKDF_EPOCH_INFO = b"anonymous-chat-v1|epoch-key"
 _HKDF_FILE_INFO = b"anonymous-chat-v1|file-key"
+_HKDF_SIMPLE_ROOM_INFO = b"anonymous-chat-v1|simple-room-secret"
 
 INVITE_PREFIX = "anon1"  # format d'invite : anon1:<room_id_b64>:<secret_b64>
 
@@ -170,6 +171,29 @@ class Room:
             room_id=secrets.token_bytes(8),
             secret=secrets.token_bytes(ROOM_SECRET_SIZE),
         )
+
+    @staticmethod
+    def simple(name: str, password: str | None) -> "Room":
+        """Salon "simple" (voir `/join`) : le secret de chiffrement est
+        dérivé directement du nom (+ mot de passe optionnel), sans
+        aucun partage d'invitation hors bande.
+
+        ⚠ LIMITE DE CONFIDENTIALITÉ IMPORTANTE, à annoncer clairement à
+        l'utilisateur (voir docs/crypto.md §13) : le nom du salon
+        transite en clair vers le serveur (pour le routage), et le mot
+        de passe du salon aussi (le serveur doit le vérifier). Un
+        serveur — ou son administrateur — qui connaît donc déjà les
+        DEUX peut recalculer exactement ce même secret et déchiffrer
+        les messages. Ce mode protège contre un observateur réseau
+        passif qui ne connaît ni le nom ni le mot de passe, mais PAS
+        contre le serveur lui-même. Pour une confidentialité garantie
+        même contre le serveur, utilisez `Room.create_new()` +
+        partage d'invitation hors bande, ou l'échange X25519."""
+
+        room_id = hashlib.sha256(f"anonymous-simple-room|{name}".encode("utf-8")).digest()[:8]
+        ikm = f"{name}|{password or ''}".encode("utf-8")
+        secret = _hkdf(ikm=ikm, salt=room_id, info=_HKDF_SIMPLE_ROOM_INFO)
+        return Room(room_id=room_id, secret=secret)
 
 
 # ============================================================

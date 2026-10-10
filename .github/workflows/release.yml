@@ -80,6 +80,7 @@ jobs:
           --onefile
           --mingw64
           --follow-imports
+          --assume-yes-for-downloads
           --include-module=websockets.asyncio.client
           --include-package=cryptography
           --include-package=requests
@@ -93,6 +94,7 @@ jobs:
           --onefile
           --mingw64
           --follow-imports
+          --assume-yes-for-downloads
           --include-package=uvicorn
           --include-package=starlette
           --include-package=fastapi
@@ -141,6 +143,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker exige un nom de repository entièrement en minuscules,
+      # mais `github.repository` garde la casse réelle du dépôt GitHub
+      # (ex. "yo-le-zz/Anonymous" avec un A majuscule) — d'où l'échec
+      # réel observé : "repository name must be lowercase". On calcule
+      # donc la version minuscule une fois ici, et on la réutilise
+      # dans les deux tags ci-dessous plutôt que d'y remettre
+      # `github.repository` tel quel.
+      - name: Compute lowercase image name
+        id: image_name
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Build (and push on tag)
         uses: docker/build-push-action@v6
         with:
@@ -148,8 +161,8 @@ jobs:
           file: server/Dockerfile
           push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: |
-            ghcr.io/${{ github.repository }}/anonymous-server:latest
-            ghcr.io/${{ github.repository }}/anonymous-server:${{ github.ref_name }}
+            ghcr.io/${{ steps.image_name.outputs.name }}/anonymous-server:latest
+            ghcr.io/${{ steps.image_name.outputs.name }}/anonymous-server:${{ github.ref_name }}
 
   # ============================================================
   # PUBLICATION DE LA RELEASE GITHUB

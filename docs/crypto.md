@@ -460,3 +460,45 @@ Le README et la page d'accueil du serveur (`GET /`) affichent un
 avertissement clair quand ce mode est actif — voir docs/privacy.md
 pour la formulation exacte et pourquoi ce choix doit rester explicite
 et visible.
+
+## 13. Salons "simples" (`/join`) — convenance contre confidentialité
+
+Le mécanisme d'origine (`/room new` + partage d'invitation hors bande,
+ou `/room exchange` par X25519, §3) garantit un secret que le serveur
+ne peut jamais recalculer, PARCE QUE le serveur ne voit jamais ce
+secret lui-même. C'est la seule façon cryptographiquement honnête
+d'obtenir une confidentialité qui résiste même à un serveur
+malveillant — mais cela demande une étape manuelle de partage.
+
+`/join <salon> [mot_de_passe]` répond à un besoin différent : un
+salon de groupe classique (comme un canal IRC/Discord protégé par mot
+de passe), sans étape de partage séparée. Le secret de chiffrement en
+est dérivé directement :
+
+```
+secret = HKDF-SHA256(
+    ikm  = "<nom_du_salon>|<mot_de_passe_ou_vide>",
+    salt = SHA256("anonymous-simple-room|" + nom_du_salon)[:8],
+    info = "anonymous-chat-v1|simple-room-secret",
+)
+```
+
+**Limite de confidentialité assumée et annoncée à l'utilisateur** : le
+nom du salon transite en clair vers le serveur (routage), et le mot de
+passe du salon aussi (le serveur doit le vérifier — voir `/rooms` et
+`_resolve_room` côté serveur). Un serveur qui connaît donc déjà les
+DEUX entrées peut recalculer exactement le même secret et déchiffrer.
+
+Ce n'est PAS un défaut caché : c'est un compromis explicite, affiché à
+chaque `/join`, entre deux modèles de menace différents :
+
+| | `/room new` + invitation | `/join <nom> [mdp]` |
+|---|---|---|
+| Protège contre un observateur réseau passif sans le secret | Oui | Oui |
+| Protège contre les autres membres du salon qui ne connaissent pas le secret | Oui | Oui (s'ils ne connaissent ni le nom ni le mot de passe) |
+| Protège contre le serveur/l'administrateur lui-même | **Oui** | **Non** |
+| Nécessite un partage hors bande | Oui | Non |
+
+Utilisez `/join` pour la commodité d'un salon de groupe où vous faites
+confiance à l'opérateur du serveur ; utilisez `/room new` dès que la
+confidentialité doit résister à l'opérateur du serveur lui-même.

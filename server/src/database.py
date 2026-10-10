@@ -33,6 +33,13 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+# Types d'enveloppe qui consomment un numéro visible (`room_seq`) dans
+# leur salon. Les réactions ("reaction") n'en consomment JAMAIS un :
+# elles s'affichent agrégées à côté du message qu'elles ciblent, pas
+# comme une ligne numérotée à part — voir `create_message()` plus bas
+# et `docs/crypto.md`.
+ROOM_SEQ_TYPES = ("msg", "file")
+
 _local = threading.local()
 
 _db_path: Path | None = None
@@ -98,7 +105,8 @@ def init_database() -> None:
                 nonce TEXT NOT NULL,
                 ciphertext TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                room_seq INTEGER
             )
             """
         )
@@ -152,11 +160,45 @@ def init_database() -> None:
                 "ALTER TABLE messages ADD COLUMN room TEXT NOT NULL DEFAULT 'general'"
             )
 
+        if "room_seq" not in messages_columns:
+            # Introduit avec la numérotation par salon (v1.0.7) : le
+            # numéro affiché au client (`#N`) est désormais propre à
+            # chaque salon plutôt que global, et les réactions n'en
+            # consomment jamais un (NULL pour elles, voir
+            # ROOM_SEQ_TYPES). NULLable car les anciennes lignes et les
+            # réactions n'en ont pas.
+            connection.execute("ALTER TABLE messages ADD COLUMN room_seq INTEGER")
+
+            # Rétro-remplissage des lignes déjà en base : on numérote
+            # chaque salon indépendamment, dans l'ordre d'insertion
+            # (id croissant), en ne comptant que les types qui
+            # consomment un numéro — exactement la même règle que pour
+            # les nouvelles insertions (voir create_message()).
+            placeholders = ",".join("?" for _ in ROOM_SEQ_TYPES)
+            connection.execute(
+                f"""
+                WITH numbered AS (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY room ORDER BY id ASC
+                    ) AS rn
+                    FROM messages
+                    WHERE envelope_type IN ({placeholders})
+                )
+                UPDATE messages
+                SET room_seq = (SELECT rn FROM numbered WHERE numbered.id = messages.id)
+                WHERE id IN (SELECT id FROM numbered)
+                """,
+                ROOM_SEQ_TYPES,
+            )
+
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages (created_at)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_room ON messages (room)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages (room, room_seq)"
         )
 
 
@@ -179,14 +221,29 @@ def create_message(
     size_bytes = len(ciphertext)
 
     with transaction() as connection:
+        room_seq = None
+        if envelope_type in ROOM_SEQ_TYPES:
+            # Calculé dans la MÊME transaction que l'insertion (le
+            # verrou d'écriture global sérialise déjà tous les appels,
+            # voir transaction()) : pas de risque de collision entre
+            # deux messages du même salon insérés "en même temps". Les
+            # réactions (et tout autre type hors ROOM_SEQ_TYPES) ne
+            # passent jamais ici et gardent room_seq = NULL — elles ne
+            # consomment donc jamais de numéro visible.
+            row = connection.execute(
+                "SELECT MAX(room_seq) AS max_seq FROM messages WHERE room = ?",
+                (room,),
+            ).fetchone()
+            room_seq = (row["max_seq"] or 0) + 1
+
         cursor = connection.execute(
             """
             INSERT INTO messages (
                 envelope_type, protocol_version, algorithm,
                 key_id, nonce, ciphertext, size_bytes, created_at,
-                anonymous_number, room
+                anonymous_number, room, room_seq
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 envelope_type,
@@ -199,6 +256,7 @@ def create_message(
                 time.time(),
                 anonymous_number,
                 room,
+                room_seq,
             ),
         )
         message_id = cursor.lastrowid

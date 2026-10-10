@@ -1,6 +1,7 @@
 import asyncio
 import curses
 import json
+import locale
 import mimetypes
 import os
 import threading
@@ -80,19 +81,186 @@ is_admin: bool = False  # jamais annoncé au serveur ni visible des autres
 # connexion en cours.
 local_nicknames: dict[int, tuple[str, str]] = {}  # numéro -> (nom, couleur)
 NICKNAME_COLORS = ("cyan", "green", "yellow", "magenta", "white", "red")
+NICKNAME_COLOR_PAIRS = {"cyan": 1, "green": 2, "red": 3, "yellow": 4, "magenta": 5, "white": 6}
+
+# Réactions agrégées par message ciblé : {id_message: {emoji: nombre}}.
+# Une réaction n'est JAMAIS affichée comme une ligne de discussion à
+# part entière — elle est ajoutée en petit à côté du message ciblé
+# (voir draw_chat), pour éviter que le fil de discussion ne se
+# remplisse de lignes "😀 en réaction à #12".
+reactions_by_target: dict[int, dict[str, int]] = {}
+reactions_lock = threading.Lock()
+
+EMOJI_PRESETS = [
+    ("👍", "pouce en l'air"),
+    ("👎", "pouce en bas"),
+    ("😂", "rire"),
+    ("❤️", "cœur"),
+    ("😮", "surprise"),
+    ("😢", "triste"),
+    ("🎉", "fête"),
+    ("🔥", "feu"),
+]
+
+# Suggestions de commandes affichées au-dessus de la zone de saisie
+# dès que le texte tapé commence par "/" (voir draw_chat) : nom,
+# gabarit d'arguments (placeholder), description courte.
+COMMAND_HELP = [
+    ("/connect", "<url> [mot_de_passe]", "se connecter à un serveur"),
+    ("/disconnect", "", "se déconnecter"),
+    ("/server", "", "état de connexion"),
+    ("/join", "<salon> [mot_de_passe]", "rejoindre/créer un salon simple"),
+    ("/room", "new|join|use|leave|list|password ...", "gérer les salons (avancé)"),
+    ("/upload", "<chemin>", "envoyer un fichier chiffré"),
+    ("/download", "[id]", "télécharger un fichier (dernier par défaut)"),
+    ("/react", "[numéro|emoji] [id]", "réagir (dernier message par défaut)"),
+    ("/reply", "[id] <texte>", "répondre (dernier message par défaut)"),
+    ("/nick", "<numéro> <nom> [couleur]", "pseudo local"),
+    ("/admin", "claim|reload|room-password ...", "administration éphémère"),
+    ("/help", "", "liste des commandes"),
+    ("/quit", "", "quitter"),
+]
+
+# Indicateurs "en train d'écrire" (voir docs/crypto.md) : numéro ->
+# horodatage local (monotonic) de la dernière confirmation reçue.
+# Purgé après quelques secondes sans nouvelle confirmation (voir
+# draw_chat / websocket_listener_async), jamais persisté.
+typing_users: dict[int, float] = {}
+typing_lock = threading.Lock()
+TYPING_EXPIRY_SECONDS = 6
 
 # Signal (thread-safe) qu'un indicateur "en train d'écrire" doit être
-# envoyé au prochain passage de la boucle WebSocket — voir
+# envoyé/arrêté au prochain passage de la boucle WebSocket — voir
 # input_loop() et websocket_listener_async().
 _typing_signal = threading.Event()
+_typing_stop_signal = threading.Event()
+_own_typing_active = False
+_own_last_typing_sent = 0.0
 
 ws_generation = 0  # incrémenté à chaque /connect ou /disconnect pour
                    # invalider proprement le thread WebSocket précédent
+
+# ------------------------------------------------------------------
+# Historique local de saisie (flèches haut/bas) — purement un confort
+# d'UI, JAMAIS envoyé au serveur ni persisté entre sessions : juste la
+# liste des commandes/messages déjà tapés pendant cette connexion-ci.
+# ------------------------------------------------------------------
+input_history: list[str] = []
+MAX_INPUT_HISTORY = 200
+# None = pas en train de naviguer l'historique (saisie libre). Un
+# entier est l'index dans `input_history` (0 = le plus ancien montré,
+# len(input_history) = "au-delà du plus récent", c.-à-d. retour au
+# brouillon en cours via _history_draft).
+_history_index: int | None = None
+# Ce que l'utilisateur était en train de taper AVANT d'appuyer sur
+# flèche haut pour la première fois — restauré si on redescend
+# au-delà du message le plus récent de l'historique (comme un shell).
+_history_draft: str = ""
+
+
+def _remember_input(text: str) -> None:
+    """Ajoute `text` à l'historique local, sauf doublon consécutif
+    immédiat (spam du même message/commande), et plafonne la taille."""
+
+    global input_history
+    if not text:
+        return
+    if input_history and input_history[-1] == text:
+        return
+    input_history.append(text)
+    if len(input_history) > MAX_INPUT_HISTORY:
+        input_history = input_history[-MAX_INPUT_HISTORY:]
+
+
+def _maybe_send_typing(input_text: str) -> None:
+    """Appelée à chaque caractère tapé. N'envoie un signal "en train
+    d'écrire" que pour un VRAI message (jamais pour une commande "/"),
+    et seulement toutes les ~3 secondes tant que la saisie continue —
+    pas à chaque touche, pour ne pas surcharger le salon."""
+
+    global _own_typing_active, _own_last_typing_sent
+
+    composing_message = bool(input_text) and not input_text.startswith("/")
+    now = time.monotonic()
+
+    if composing_message:
+        if not _own_typing_active or (now - _own_last_typing_sent) > 3:
+            _own_typing_active = True
+            _own_last_typing_sent = now
+            _typing_stop_signal.clear()
+            _typing_signal.set()
+    else:
+        _send_stopped_typing()
+
+
+def _send_stopped_typing() -> None:
+    global _own_typing_active
+
+    if _own_typing_active:
+        _own_typing_active = False
+        _typing_signal.clear()
+        _typing_stop_signal.set()
+
+
+_current_input_buffer = ""
+_current_input_buffer_lock = threading.Lock()
+
+
+def _current_input_text() -> str:
+    with _current_input_buffer_lock:
+        return _current_input_buffer
+
+
+def _set_current_input_text(text: str) -> None:
+    global _current_input_buffer
+    with _current_input_buffer_lock:
+        _current_input_buffer = text
+
+
+def _prune_stale_typing() -> bool:
+    """Purge les indicateurs "en train d'écrire" trop anciens (au cas
+    où un signal d'arrêt aurait été perdu, ex. déconnexion brutale).
+    Retourne True si l'affichage doit être rafraîchi."""
+
+    now = time.monotonic()
+    removed = False
+
+    with typing_lock:
+        stale = [number for number, seen_at in typing_users.items() if now - seen_at > TYPING_EXPIRY_SECONDS]
+        for number in stale:
+            del typing_users[number]
+            removed = True
+
+    return removed
 
 
 # ============================================================
 # UTILITAIRES D'ÉTAT
 # ============================================================
+
+def _leave_current_room() -> None:
+    """Quitte le salon actif sans se déconnecter du serveur : repasse
+    en état "aucun salon actif" (voir prepare_incoming, qui affiche
+    alors '[aucun salon actif...]' pour tout message reçu entre temps).
+    Bascule `ws_generation` comme set_room() pour invalider proprement
+    le thread WebSocket abonné à l'ancien salon — sans ça, il resterait
+    abonné à un salon qu'on vient pourtant de quitter."""
+
+    global current_room_name, current_room, keyring, ws_generation
+
+    with state_lock:
+        current_room_name = None
+        current_room = None
+        keyring = None
+        ws_generation += 1
+
+    with messages_lock:
+        messages.clear()
+    with reactions_lock:
+        reactions_by_target.clear()
+    with _seen_reaction_ids_lock:
+        _seen_reaction_ids.clear()
+
 
 def set_room(name: str, room: Room) -> None:
     global current_room_name, current_room, keyring, ws_generation
@@ -159,6 +327,11 @@ def prepare_incoming(envelope_dict: dict) -> dict:
 
     entry = {
         "id": envelope_dict.get("id"),
+        # Numéro affiché à l'utilisateur ("#N"), propre à CHAQUE salon
+        # (pas un id global) — voir ROOM_SEQ_TYPES côté serveur. None
+        # pour tout ce qui n'en consomme pas (réactions notamment) :
+        # elles ne doivent jamais apparaître comme une ligne numérotée.
+        "room_seq": envelope_dict.get("room_seq"),
         "created_at": envelope_dict.get("created_at", ""),
         "anonymous_number": envelope_dict.get("anonymous_number"),
     }
@@ -209,6 +382,8 @@ def prepare_incoming(envelope_dict: dict) -> dict:
             reaction = ReactionPayload.decode(plaintext)
             entry["content"] = f"{reaction.emoji} en réaction à #{reaction.target_id}"
             entry["is_reaction"] = True
+            entry["reaction_emoji"] = reaction.emoji
+            entry["reaction_target_id"] = reaction.target_id
         except (json.JSONDecodeError, KeyError):
             entry["content"] = "[réaction indisponible]"
             entry["unavailable"] = True
@@ -220,7 +395,10 @@ def prepare_incoming(envelope_dict: dict) -> dict:
             kind = "Image" if meta.mime_type.startswith("image/") else (
                 "Video" if meta.mime_type.startswith("video/") else "File"
             )
-            entry["content"] = f"[{kind}] {meta.filename} ({meta.size_bytes} octets) — /download {meta.file_id}"
+            # On n'affiche plus le file_id brut (UUID illisible, jamais
+            # utile à l'utilisateur) : /download tout court (dernier
+            # fichier) ou /download #N (ce numéro, via room_seq) suffit.
+            entry["content"] = f"[{kind}] {meta.filename} ({meta.size_bytes} octets) — /download"
             entry["file_meta"] = meta.encode().decode("utf-8")
             # L'epoch utilisée pour chiffrer les blocs du fichier est la
             # même que celle du message d'enveloppe qui transporte ses
@@ -238,12 +416,55 @@ def prepare_incoming(envelope_dict: dict) -> dict:
     return entry
 
 
+_seen_reaction_ids: set[int] = set()
+_seen_reaction_ids_lock = threading.Lock()
+
+
 def add_local_message(entry: dict) -> None:
+    if entry.get("is_reaction") and not entry.get("unavailable"):
+        # Une réaction n'occupe jamais sa propre ligne de discussion :
+        # elle est agrégée sur le message ciblé (voir draw_chat). On
+        # déduplique par id d'enveloppe (écho local + diffusion WS
+        # peuvent toutes les deux livrer la même réaction).
+        message_id = entry.get("id")
+        with _seen_reaction_ids_lock:
+            if message_id is not None:
+                if message_id in _seen_reaction_ids:
+                    return
+                _seen_reaction_ids.add(message_id)
+
+        # `reaction_target_id` est le numéro que l'émetteur a tapé
+        # (/react <emoji> <N>) ou celui par défaut (_last_room_seq()) :
+        # c'est donc déjà un numéro de salon (`room_seq`), pas un id
+        # global — `reactions_by_target` est keyé pareil, voir draw_chat.
+        target_room_seq = entry.get("reaction_target_id")
+        emoji = entry.get("reaction_emoji")
+
+        if target_room_seq is not None and emoji:
+            with reactions_lock:
+                counts = reactions_by_target.setdefault(target_room_seq, {})
+                counts[emoji] = counts.get(emoji, 0) + 1
+        return
+
     with messages_lock:
         for existing in messages:
             if existing.get("id") == entry.get("id") and entry.get("id") is not None:
                 return
         messages.append(entry)
+
+
+def _last_room_seq() -> int | None:
+    """Numéro de salon (`#N`, propre au salon courant — PAS un id
+    global) du dernier vrai message reçu (ni système, ni réaction —
+    celles-ci n'apparaissent plus comme des lignes à part entière).
+    Utilisé pour que /react et /reply fonctionnent SANS que
+    l'utilisateur ait à chercher/compter un numéro à la main."""
+
+    with messages_lock:
+        for entry in reversed(messages):
+            if entry.get("room_seq") is not None and not entry.get("system"):
+                return entry["room_seq"]
+    return None
 
 
 def show_system_message(text: str) -> None:
@@ -390,9 +611,29 @@ def fetch_history(limit: int = 50) -> None:
         history = response.json()["messages"]
         prepared = [prepare_incoming(item) for item in history]
 
+        # Bug réel découvert pendant le scan : `room_seq` repart de 1
+        # dans CHAQUE salon (voir docs/crypto.md) — sans vider l'état
+        # de réactions ici, une réaction agrégée sur le message #3 du
+        # salon précédent continuait de s'afficher par erreur sur le
+        # message #3 du nouveau salon (même numéro, salon différent).
         with messages_lock:
             messages.clear()
-            messages.extend(prepared)
+        with reactions_lock:
+            reactions_by_target.clear()
+        with _seen_reaction_ids_lock:
+            _seen_reaction_ids.clear()
+
+        # Second bug réel découvert pendant le scan : l'historique
+        # était jusqu'ici ajouté DIRECTEMENT à `messages` (extend), ce
+        # qui contournait complètement `add_local_message` — une
+        # réaction présente dans l'historique (reconnexion, /room use
+        # puis retour) s'affichait donc comme sa PROPRE ligne de
+        # discussion ("👍 en réaction à #3") au lieu d'être agrégée
+        # à côté du message ciblé. En repassant par
+        # `add_local_message`, l'historique suit exactement le même
+        # chemin que les messages reçus en direct.
+        for entry in prepared:
+            add_local_message(entry)
 
     except Exception as error:
         show_system_message(f"Erreur de récupération de l'historique : {error}")
@@ -498,83 +739,115 @@ def handle_disconnect() -> None:
 # COMMANDE : /room
 # ============================================================
 
+def handle_join(args: list[str]) -> None:
+    """Rejoint/crée un salon "simple" par nom (+ mot de passe optionnel
+    du salon), SANS partage d'invitation hors bande — voir
+    crypto.Room.simple() pour la limite de confidentialité que cela
+    implique (le serveur peut recalculer le même secret, contrairement
+    à /room new). Pratique pour un salon de groupe classique ; utilisez
+    /room new si vous avez besoin d'une confidentialité garantie même
+    contre le serveur."""
+
+    if not args:
+        show_system_message("Utilisation : /join <salon> [mot_de_passe]")
+        return
+
+    with state_lock:
+        base_url = server_url
+
+    if base_url is None:
+        show_system_message("Aucun serveur connecté. /connect d'abord.")
+        return
+
+    name = args[0]
+    password = " ".join(args[1:]) if len(args) > 1 else None
+
+    try:
+        response = requests.get(
+            f"{base_url}/rooms", headers=http_headers(),
+            timeout=Config["network"]["connect_timeout_seconds"],
+        )
+        response.raise_for_status()
+        rooms_payload = response.json()
+    except requests.RequestException as error:
+        show_system_message(f"Impossible de contacter le serveur : {error}")
+        return
+
+    existing = None
+    if rooms_payload.get("enabled", True):
+        existing = next((r for r in rooms_payload.get("rooms", []) if r["name"] == name), None)
+
+    if existing and existing["has_password"] and not password:
+        show_system_message(f"Le salon '{name}' est protégé : /join {name} <mot_de_passe>")
+        return
+
+    if existing is not None and not existing["has_password"] and password:
+        show_system_message(
+            f"Le salon '{name}' est public (pas de mot de passe) — "
+            "le mot de passe fourni sera ignoré pour la vérification serveur, "
+            "mais changerait le secret de déchiffrement : ne le précisez pas."
+        )
+        return
+
+    room = Room.simple(name, password)
+    store.save_room(name, room, server_password=password)
+    set_room(name, room)
+
+    show_system_message(f"Salon '{name}' rejoint. Empreinte : {room.fingerprint()}")
+    show_system_message(
+        "⚠ Salon \"simple\" : le secret de chiffrement dérive du nom"
+        + ("+mot de passe" if password else "")
+        + ". Un serveur qui les connaît pourrait déchiffrer — voir docs/crypto.md §13. "
+        "Pour une confidentialité garantie même contre le serveur : /room new."
+    )
+
+    if existing is None:
+        try:
+            requests.post(
+                f"{base_url}/rooms", json={"name": name, "password": password},
+                headers=http_headers(), timeout=Config["network"]["connect_timeout_seconds"],
+            )
+        except requests.RequestException:
+            pass  # le salon sera de toute façon auto-créé au premier message si autorisé
+
+    fetch_history()
+
+
 def handle_room(args: list[str]) -> None:
     if not args:
         show_system_message(
-            "Utilisation : /room new|join|use|list|password|exchange [...]"
+            "Utilisation : /room new|join|use|leave|list|password|exchange [...]"
         )
         return
 
     sub = args[0].lower()
 
-    if sub == "new":
-        if len(args) < 2:
-            show_system_message("Utilisation : /room new <nom> [mot_de_passe_de_salon]")
+    if sub == "leave":
+        with state_lock:
+            was_in_room = current_room_name
+
+        if was_in_room is None:
+            show_system_message("Aucun salon actif.")
             return
 
-        name = args[1]
-        password = args[2] if len(args) > 2 else None
-
-        room = Room.create_new()
-        store.save_room(name, room, server_password=password)
-
-        with state_lock:
-            base_url = server_url
-
-        # IMPORTANT : si un mot de passe est demandé, la création
-        # EXPLICITE côté serveur doit se faire AVANT `set_room()` —
-        # celui-ci déclenche une reconnexion WebSocket qui, elle,
-        # créerait automatiquement le salon en PUBLIC s'il n'existe
-        # pas encore (comportement voulu pour la création libre, mais
-        # qui gagnerait la course face à une création explicite faite
-        # après coup, laissant le salon public malgré le mot de passe
-        # demandé).
-        if base_url is not None:
-            try:
-                response = requests.post(
-                    f"{base_url}/rooms",
-                    json={"name": name, "password": password},
-                    headers=http_headers(),
-                    timeout=Config["network"]["connect_timeout_seconds"],
-                )
-                if response.status_code == 200:
-                    visibility = "privé (mot de passe)" if password else "public"
-                    show_system_message(f"Salon '{name}' enregistré sur le serveur ({visibility}).")
-                elif response.status_code == 409:
-                    show_system_message(
-                        f"Le salon '{name}' existe déjà sur ce serveur — "
-                        "utilisez /room password si un mot de passe est requis."
-                    )
-                else:
-                    show_system_message(f"Le serveur a refusé la création du salon : {response.text}")
-            except requests.RequestException as error:
-                show_system_message(f"Impossible de contacter le serveur pour créer le salon : {error}")
-
-        set_room(name, room)
-        show_system_message(f"Salon '{name}' créé. Empreinte : {room.fingerprint()}")
-        show_system_message(
-            f"Invite à partager HORS BANDE (jamais via ce chat) : {room.to_invite()}"
-        )
+        _leave_current_room()
+        show_system_message(f"Salon '{was_in_room}' quitté.")
         return
 
-    if sub == "join":
+    # /room new et /room join sont désormais de simples alias de /join
+    # (voir handle_join) : un salon se crée ou se rejoint par
+    # <nom> [mot_de_passe], sans invitation à partager hors bande. Plus
+    # simple à utiliser, au prix de la limite de confidentialité
+    # documentée dans docs/crypto.md §13 (le serveur connaît le nom et
+    # le mot de passe, et pourrait donc recalculer le même secret) —
+    # pour une confidentialité garantie même contre le serveur, utilisez
+    # /room exchange à la place.
+    if sub in ("new", "join"):
         if len(args) < 2:
-            show_system_message("Utilisation : /room join <invite> [nom] [mot_de_passe_de_salon]")
+            show_system_message(f"Utilisation : /room {sub} <nom> [mot_de_passe]")
             return
 
-        try:
-            room = Room.from_invite(args[1])
-        except ValueError as error:
-            show_system_message(f"Invite invalide : {error}")
-            return
-
-        name = args[2] if len(args) > 2 else "default"
-        password = args[3] if len(args) > 3 else None
-
-        store.save_room(name, room, server_password=password)
-        set_room(name, room)
-        show_system_message(f"Salon '{name}' importé. Empreinte : {room.fingerprint()}")
-        fetch_history()
+        handle_join(args[1:])
         return
 
     if sub == "use":
@@ -659,7 +932,7 @@ def handle_room(args: list[str]) -> None:
                     f" {lock} {room_info['name']} — {room_info['message_count']} message(s)"
                 )
             show_system_message(
-                "Pour rejoindre : /room join <invite> <nom>, ou /room use <nom> "
+                "Pour rejoindre : /room join <nom> [mot_de_passe], ou /room use <nom> "
                 "si vous avez déjà le secret localement."
             )
         except requests.RequestException as error:
@@ -860,7 +1133,51 @@ def handle_upload(path_str: str) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
-def handle_download(file_id: str) -> None:
+def _human_size(size_bytes: int) -> str:
+    value = float(size_bytes)
+    for unit in ("o", "Ko", "Mo", "Go"):
+        if value < 1024 or unit == "Go":
+            return f"{value:.0f} {unit}" if unit == "o" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} Go"
+
+
+def _last_file_id() -> str | None:
+    with messages_lock:
+        for entry in reversed(messages):
+            if entry.get("file_meta"):
+                try:
+                    return FileMetadataPayload.decode(entry["file_meta"].encode("utf-8")).file_id
+                except Exception:
+                    continue
+    return None
+
+
+def _resolve_file_id_from_room_seq(reference: str) -> str | None:
+    """`/download 7` est bien plus pratique que de recopier un file_id
+    (UUID long et jamais affiché nulle part côté UI) : si `reference`
+    est un nombre, on cherche le message-fichier portant ce `room_seq`
+    (le même `#N` que celui affiché devant le message dans le salon).
+    Retourne None si ce n'est pas un nombre ou si aucun fichier ne
+    correspond — l'appelant retombe alors sur `reference` tel quel
+    (compatibilité ascendante avec un vrai file_id collé à la main)."""
+
+    candidate = reference.lstrip("#")
+    if not candidate.isdigit():
+        return None
+
+    target_seq = int(candidate)
+    with messages_lock:
+        for entry in messages:
+            if entry.get("room_seq") == target_seq and entry.get("file_meta"):
+                try:
+                    return FileMetadataPayload.decode(entry["file_meta"].encode("utf-8")).file_id
+                except Exception:
+                    return None
+    return None
+
+
+def handle_download(file_id: str | None = None) -> None:
     with state_lock:
         active_keyring = keyring
         base_url = server_url
@@ -868,6 +1185,12 @@ def handle_download(file_id: str) -> None:
     if base_url is None or active_keyring is None:
         show_system_message("Aucun serveur/salon actif.")
         return
+
+    if file_id is None:
+        file_id = _last_file_id()
+        if file_id is None:
+            show_system_message("Aucun fichier reçu pour l'instant.")
+            return
 
     meta_json = None
     file_epoch = None
@@ -886,6 +1209,24 @@ def handle_download(file_id: str) -> None:
     if meta_json is None or file_epoch is None:
         show_system_message("Métadonnées de fichier introuvables localement.")
         return
+
+    # Prévisualisation avant de télécharger quoi que ce soit.
+    show_system_message(
+        f"Fichier : {meta_json.filename} — {_human_size(meta_json.size_bytes)} "
+        f"— {meta_json.mime_type or 'type inconnu'}"
+    )
+
+    default_destination = str(store.downloads_dir / meta_json.filename)
+    destination_str = _prompt_line("Enregistrer sous", default_destination)
+    destination = Path(destination_str).expanduser()
+
+    if destination.exists():
+        confirm = _prompt_line(f"'{destination}' existe déjà, écraser ? (o/N)", "n")
+        if confirm.strip().lower() not in ("o", "oui", "y", "yes"):
+            show_system_message("Téléchargement annulé.")
+            return
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     def worker():
         try:
@@ -908,7 +1249,6 @@ def handle_download(file_id: str) -> None:
                 meta_json.chunk_count,
             )
 
-            destination = store.downloads_dir / f"{file_id}_{meta_json.filename}"
             save_stream_to_path(plain_chunks, destination)
 
             show_system_message(
@@ -966,7 +1306,21 @@ async def websocket_listener_async(my_generation: int):
                             sid = session_id
                         if sid is not None:
                             try:
-                                await websocket.send(json.dumps({"type": "typing", "session_id": sid}))
+                                await websocket.send(
+                                    json.dumps({"type": "typing", "session_id": sid, "active": True})
+                                )
+                            except Exception:
+                                pass
+
+                    if _typing_stop_signal.is_set():
+                        _typing_stop_signal.clear()
+                        with state_lock:
+                            sid = session_id
+                        if sid is not None:
+                            try:
+                                await websocket.send(
+                                    json.dumps({"type": "typing", "session_id": sid, "active": False})
+                                )
                             except Exception:
                                 pass
 
@@ -975,10 +1329,14 @@ async def websocket_listener_async(my_generation: int):
                     except asyncio.TimeoutError:
                         # Pas de message reçu récemment : on boucle pour
                         # revérifier `ws_generation` (ex. changement de
-                        # salon via /room) et envoyer un éventuel signal
-                        # "en train d'écrire" en attente, sans jamais
-                        # rester bloqué indéfiniment dans un `recv()`
-                        # qui ne reviendra peut-être jamais tout seul.
+                        # salon via /room), envoyer un éventuel signal
+                        # "en train d'écrire" en attente, et purger les
+                        # indicateurs de frappe devenus obsolètes (voir
+                        # _prune_stale_typing) sans jamais rester bloqué
+                        # indéfiniment dans un `recv()` qui ne reviendra
+                        # peut-être jamais tout seul.
+                        if _prune_stale_typing() and screen is not None:
+                            draw_chat(screen, _current_input_text())
                         continue
 
                     data = json.loads(raw)
@@ -988,17 +1346,23 @@ async def websocket_listener_async(my_generation: int):
                         add_local_message(entry)
 
                         if screen is not None:
-                            draw_chat(screen)
+                            draw_chat(screen, _current_input_text())
 
                     elif data.get("type") == "typing_indicator":
                         with state_lock:
                             my_number = own_anonymous_number
                         number = data.get("anonymous_number")
+                        active = data.get("active", True)
+
                         if number is not None and number != my_number:
-                            name = _format_display_name(number, my_number)
-                            show_system_message(f"{name} est en train d'écrire...")
+                            with typing_lock:
+                                if active:
+                                    typing_users[number] = time.monotonic()
+                                else:
+                                    typing_users.pop(number, None)
+
                             if screen is not None:
-                                draw_chat(screen)
+                                draw_chat(screen, _current_input_text())
 
         except Exception as error:
             if not running:
@@ -1069,6 +1433,98 @@ def safe_addstr(window, y, x, text, attributes=0):
         pass
 
 
+def _prompt_line(prompt_text: str, default: str = "") -> str:
+    """Bloque brièvement pour demander une valeur à l'utilisateur sur
+    la ligne de saisie (ex. chemin de destination d'un téléchargement).
+    Gère correctement les caractères Unicode (accents...) via
+    `get_wch()`. Entrée vide -> retourne `default`. Doit être appelé
+    depuis le thread principal (curses), jamais depuis un thread
+    d'arrière-plan."""
+
+    if screen is None:
+        return default
+
+    height, width = screen.getmaxyx()
+    full_prompt = f"{prompt_text} [{default}] : " if default else f"{prompt_text} : "
+    text = ""
+
+    curses.curs_set(1)
+    try:
+        while True:
+            safe_addstr(screen, height - 1, 0, " " * (width - 1))
+            safe_addstr(screen, height - 1, 0, full_prompt, curses.color_pair(2) | curses.A_BOLD)
+            safe_addstr(screen, height - 1, min(width - 2, len(full_prompt)), text, curses.color_pair(6))
+            screen.refresh()
+
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                continue
+
+            # Même bug que celui corrigé dans input_loop (voir plus
+            # bas) : `get_wch()` peut livrer Entrée/Backspace comme un
+            # entier SPÉCIAL (curses.KEY_ENTER...) OU comme la CHAÎNE
+            # "\n"/"\r"/"\x7f" selon le terminal. Ce prompt ne testait
+            # Entrée que dans le cas entier — sur un terminal livrant
+            # la chaîne, taper un chemin et appuyer sur Entrée ne
+            # faisait RIEN (bug réel observé : impossible de valider
+            # un chemin de destination personnalisé). Détecté
+            # indépendamment du type, comme dans input_loop.
+            is_enter = key in (curses.KEY_ENTER, 10, 13, "\n", "\r")
+            is_backspace = key in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b")
+
+            if is_enter:
+                return text.strip() or default
+            if is_backspace:
+                text = text[:-1]
+            elif key == 27:  # Échap : annule, garde le défaut
+                return default
+            elif isinstance(key, str) and key.isprintable():
+                text += key
+    finally:
+        curses.curs_set(0)
+
+
+def _typing_status_text() -> str:
+    _prune_stale_typing()
+
+    with state_lock:
+        my_number = own_anonymous_number
+
+    with typing_lock:
+        numbers = [n for n in typing_users if n != my_number]
+
+    if not numbers:
+        return ""
+
+    if len(numbers) > 2:
+        return "Plusieurs personnes sont en train d'écrire..."
+
+    names = [_format_display_name(n, my_number) for n in numbers]
+
+    if len(names) == 1:
+        return f"{names[0]} est en train d'écrire..."
+
+    return f"{names[0]} et {names[1]} sont en train d'écrire..."
+
+
+def _matching_commands(input_text: str) -> list[tuple[str, str, str]]:
+    if not input_text.startswith("/"):
+        return []
+
+    parts = input_text.split(" ", 1)
+    typed_command = parts[0].lower()
+    has_args_started = len(parts) > 1
+
+    if has_args_started:
+        # La commande est déjà choisie : un seul rappel de son gabarit
+        # d'arguments, pas une liste de correspondances.
+        match = next((c for c in COMMAND_HELP if c[0] == typed_command), None)
+        return [match] if match else []
+
+    return [c for c in COMMAND_HELP if c[0].startswith(typed_command)][:5]
+
+
 def draw_chat(window, input_text=""):
     with draw_lock:
         height, width = window.getmaxyx()
@@ -1086,37 +1542,104 @@ def draw_chat(window, input_text=""):
 
         safe_addstr(window, 1, 2, status, curses.color_pair(5))
 
+        # Zone réservée en bas, AU-DESSUS de la ligne de saisie, pour :
+        # - les suggestions de commande (jusqu'à 5 lignes, seulement
+        #   pendant la frappe d'une commande) ;
+        # - l'indicateur "en train d'écrire" (1 ligne, façon Discord).
+        # Dimensionnée dynamiquement pour ne pas gâcher de place quand
+        # rien n'est affiché.
+        suggestions = _matching_commands(input_text)
+        typing_text = _typing_status_text()
+
+        reserved_bottom = 2  # séparateur + ligne de saisie
+        if typing_text:
+            reserved_bottom += 1
+        if suggestions:
+            reserved_bottom += len(suggestions)
+
         with messages_lock:
             current_messages = list(messages)
 
-        message_height = max(1, height - 4)
+        message_height = max(1, height - 2 - reserved_bottom)
         visible = current_messages[-message_height:]
 
-        y = 2
+        # Regroupe les lignes indisponibles/système consécutives et
+        # identiques (ex. plusieurs messages non déchiffrables d'affilée)
+        # en une seule ligne "(×N)", plutôt que de répéter N fois le
+        # même texte à l'écran.
+        collapsed: list[tuple[dict, int]] = []
         for message in visible:
-            if y >= height - 2:
+            if (
+                collapsed
+                and message.get("unavailable")
+                and collapsed[-1][0].get("unavailable")
+                and collapsed[-1][0].get("content") == message.get("content")
+            ):
+                previous_message, count = collapsed[-1]
+                collapsed[-1] = (previous_message, count + 1)
+            else:
+                collapsed.append((message, 1))
+
+        y = 2
+        for message, repeat_count in collapsed:
+            if y >= height - reserved_bottom:
                 break
 
             content = message.get("content", "")
+            if repeat_count > 1:
+                content = f"{content}  (×{repeat_count})"
 
             if message.get("system"):
                 safe_addstr(window, y, 2, content, curses.color_pair(4))
             elif message.get("unavailable"):
                 safe_addstr(window, y, 2, content, curses.color_pair(3) | curses.A_DIM)
             else:
+                # Numéro affiché et utilisé pour /react, /reply,
+                # /download <N> : propre au salon courant (room_seq),
+                # PAS l'id global en base — voir docs/crypto.md.
+                room_seq = message.get("room_seq")
+                id_prefix = f"#{room_seq} " if room_seq is not None else ""
+                safe_addstr(window, y, 2, id_prefix, curses.A_DIM)
+
+                number = message.get("anonymous_number")
+                nickname_entry = local_nicknames.get(number) if number is not None else None
+                color_pair_number = NICKNAME_COLOR_PAIRS.get(nickname_entry[1], 1) if nickname_entry else 1
+
                 prefix = f"{message.get('display_name', 'Anonymous #??????')} : "
-                safe_addstr(window, y, 2, prefix, curses.color_pair(1) | curses.A_BOLD)
-                safe_addstr(window, y, 2 + len(prefix), content, curses.color_pair(6))
+                x = 2 + len(id_prefix)
+                safe_addstr(window, y, x, prefix, curses.color_pair(color_pair_number) | curses.A_BOLD)
+
+                full_content = content
+                if room_seq is not None:
+                    with reactions_lock:
+                        target_reactions = reactions_by_target.get(room_seq)
+                    if target_reactions:
+                        summary = " ".join(f"{emoji}×{n}" for emoji, n in target_reactions.items())
+                        full_content = f"{content}  {summary}"
+
+                safe_addstr(window, y, x + len(prefix), full_content, curses.color_pair(6))
 
             y += 1
 
-        safe_addstr(window, height - 3, 0, "-" * max(1, width - 1), curses.color_pair(1))
-        safe_addstr(window, height - 2, 0, "> ", curses.color_pair(2) | curses.A_BOLD)
-        safe_addstr(window, height - 2, 2, input_text, curses.color_pair(6))
+        bottom_y = height - reserved_bottom
+
+        for offset, (name, placeholder, description) in enumerate(suggestions):
+            line = f"{name} {placeholder}" if placeholder else name
+            safe_addstr(window, bottom_y + offset, 2, f"{line}  — {description}", curses.color_pair(2) | curses.A_DIM)
+
+        if typing_text:
+            safe_addstr(
+                window, bottom_y + len(suggestions), 2, typing_text,
+                curses.color_pair(5) | curses.A_ITALIC if hasattr(curses, "A_ITALIC") else curses.color_pair(5),
+            )
+
+        safe_addstr(window, height - 2, 0, "-" * max(1, width - 1), curses.color_pair(1))
+        safe_addstr(window, height - 1, 0, "> ", curses.color_pair(2) | curses.A_BOLD)
+        safe_addstr(window, height - 1, 2, input_text, curses.color_pair(6))
 
         cursor_x = min(width - 1, 2 + len(input_text))
         try:
-            window.move(height - 2, cursor_x)
+            window.move(height - 1, cursor_x)
         except curses.error:
             pass
 
@@ -1165,8 +1688,13 @@ def handle_nick(args: list[str]) -> None:
 # ============================================================
 
 def handle_react(args: list[str]) -> None:
-    if len(args) < 2:
-        show_system_message("Utilisation : /react <id_message> <emoji>")
+    if not args:
+        show_system_message(
+            "Réactions rapides : /react <numéro> [id]  (id omis = dernier message)"
+        )
+        for index, (emoji, label) in enumerate(EMOJI_PRESETS, start=1):
+            show_system_message(f"  {index}. {emoji}  {label}")
+        show_system_message("Ou directement un emoji : /react 😀 [id]")
         return
 
     with state_lock:
@@ -1177,15 +1705,29 @@ def handle_react(args: list[str]) -> None:
         show_system_message("Aucun serveur/salon actif.")
         return
 
-    try:
-        target_id = int(args[0])
-    except ValueError:
-        show_system_message("L'id du message doit être un nombre (visible dans l'historique).")
+    first = args[0]
+
+    if first.isdigit() and 1 <= int(first) <= len(EMOJI_PRESETS):
+        emoji = EMOJI_PRESETS[int(first) - 1][0]
+    else:
+        emoji = first
+
+    target_id = None
+    if len(args) > 1:
+        candidate = args[1].lstrip("#")
+        if candidate.isdigit():
+            target_id = int(candidate)
+
+    if target_id is None:
+        target_id = _last_room_seq()
+
+    if target_id is None:
+        show_system_message("Aucun message disponible auquel réagir pour l'instant.")
         return
 
     from crypto import encrypt_message
 
-    payload = ReactionPayload(emoji=args[1], target_id=target_id)
+    payload = ReactionPayload(emoji=emoji, target_id=target_id)
     envelope = encrypt_message(active_keyring, payload.encode(), envelope_type="reaction")
 
     try:
@@ -1197,8 +1739,8 @@ def handle_react(args: list[str]) -> None:
 
 
 def handle_reply(args: list[str]) -> None:
-    if len(args) < 2:
-        show_system_message("Utilisation : /reply <id_message> <texte>")
+    if not args:
+        show_system_message("Utilisation : /reply [id] <texte>  (id omis = dernier message)")
         return
 
     with state_lock:
@@ -1209,15 +1751,28 @@ def handle_reply(args: list[str]) -> None:
         show_system_message("Aucun serveur/salon actif.")
         return
 
-    try:
-        target_id = int(args[0])
-    except ValueError:
-        show_system_message("L'id du message doit être un nombre (visible dans l'historique).")
+    target_id = None
+    text_args = args
+
+    first_candidate = args[0].lstrip("#")
+    if first_candidate.isdigit() and len(args) > 1:
+        target_id = int(first_candidate)
+        text_args = args[1:]
+
+    if target_id is None:
+        target_id = _last_room_seq()
+
+    if target_id is None:
+        show_system_message("Aucun message disponible auquel répondre pour l'instant.")
+        return
+
+    if not text_args:
+        show_system_message("Utilisation : /reply [id] <texte>")
         return
 
     from crypto import encrypt_message
 
-    text = " ".join(args[1:])
+    text = " ".join(text_args)
     payload = TextPayload(body=text, reply_to=target_id)
     envelope = encrypt_message(active_keyring, payload.encode())
 
@@ -1334,12 +1889,13 @@ def handle_command(command: str) -> bool:
         show_system_message("/connect URL [password]   se connecter à un serveur")
         show_system_message("/disconnect               se déconnecter")
         show_system_message("/server                   afficher l'état de connexion")
-        show_system_message("/room new|join|use|list|password    gérer les salons")
+        show_system_message("/join salon [mot_de_passe]  rejoindre/créer un salon simple")
+        show_system_message("/room new|join|use|list|password    salons avancés (E2EE garantie)")
         show_system_message("/room exchange start|respond|finish   échange X25519")
         show_system_message("/upload chemin            envoyer un fichier chiffré")
-        show_system_message("/download id              télécharger un fichier reçu")
-        show_system_message("/react id emoji           réagir à un message")
-        show_system_message("/reply id texte           répondre à un message")
+        show_system_message("/download [id]            télécharger un fichier (dernier par défaut)")
+        show_system_message("/react [numéro|emoji] [id]   réagir (dernier message par défaut)")
+        show_system_message("/reply [id] texte         répondre (dernier message par défaut)")
         show_system_message("/nick numéro nom [couleur]  pseudo local (jamais envoyé)")
         show_system_message("/admin claim|reload|room-password   administration éphémère")
         show_system_message("/quit                     quitter")
@@ -1373,6 +1929,10 @@ def handle_command(command: str) -> bool:
         handle_room(args)
         return False
 
+    if cmd == "/join":
+        handle_join(args)
+        return False
+
     if cmd == "/upload":
         if not args:
             show_system_message("Utilisation : /upload chemin_du_fichier")
@@ -1381,10 +1941,15 @@ def handle_command(command: str) -> bool:
         return False
 
     if cmd == "/download":
-        if not args:
-            show_system_message("Utilisation : /download id_fichier")
-        else:
-            handle_download(args[0])
+        # Accepte : aucun argument (dernier fichier reçu), un numéro
+        # #N (room_seq, celui affiché devant le message), ou un
+        # file_id brut collé à la main (compatibilité ascendante).
+        reference = args[0] if args else None
+        if reference is not None:
+            resolved = _resolve_file_id_from_room_seq(reference)
+            if resolved is not None:
+                reference = resolved
+        handle_download(reference)
         return False
 
     if cmd == "/react":
@@ -1415,7 +1980,7 @@ def handle_command(command: str) -> bool:
 # ============================================================
 
 def input_loop(window):
-    global running
+    global running, _history_index, _history_draft
 
     input_text = ""
     window.keypad(True)
@@ -1424,14 +1989,42 @@ def input_loop(window):
     while running:
         draw_chat(window, input_text)
 
-        key = window.getch()
+        try:
+            key = window.get_wch()
+        except curses.error:
+            continue
 
-        if key in (curses.KEY_ENTER, 10, 13):
+        # `get_wch()` retourne soit un entier (touches spéciales,
+        # flèches, Backspace...), soit une chaîne d'UN caractère
+        # Unicode (lettres, accents, emoji...) — contrairement à
+        # `getch()` qui ne gère que l'ASCII 0-255 et cassait toute
+        # saisie contenant des accents ou des emoji.
+        #
+        # IMPORTANT : Entrée peut être livrée SOIT comme entier
+        # (curses.KEY_ENTER) SOIT comme la chaîne "\n"/"\r" selon le
+        # terminal — il faut donc la détecter AVANT de trier sur le
+        # type, sans quoi "\n" tombe dans la branche "texte", n'est
+        # pas imprimable, et Entrée ne fait plus rien du tout (bug
+        # réel observé : plus aucun message ni commande ne partait).
+        # 27 (ESC) est inclus car certains terminaux / claviers (pavé
+        # numérique sur certains émulateurs) livrent Entrée comme ESC
+        # dans de rares configurations — fix remonté par l'utilisateur
+        # lui-même après un cas réel observé.
+        is_enter = key in (curses.KEY_ENTER, 10, 13, 27, "\n", "\r")
+        is_backspace = key in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b")
+
+        if is_enter:
             text = input_text.strip()
             input_text = ""
+            _history_index = None
+            _history_draft = ""
+            _set_current_input_text(input_text)
+            _send_stopped_typing()
 
             if not text:
                 continue
+
+            _remember_input(text)
 
             if text.startswith("/"):
                 if handle_command(text):
@@ -1446,18 +2039,63 @@ def input_loop(window):
                 except Exception as error:
                     show_system_message(f"Erreur : {error}")
 
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
+        elif is_backspace:
             input_text = input_text[:-1]
+            _history_index = None  # on édite -> on quitte la navigation
+            _set_current_input_text(input_text)
+            if not input_text:
+                _send_stopped_typing()
 
-        elif 32 <= key <= 126:
-            was_empty = not input_text
-            input_text += chr(key)
-            if was_empty:
-                # Signal "en train d'écrire" — uniquement au début
-                # d'une saisie, pas à chaque touche (voir
-                # websocket_listener_async, qui l'envoie au prochain
-                # passage de sa boucle, sous 1 seconde).
-                _typing_signal.set()
+        elif key in (curses.KEY_UP, curses.KEY_DOWN):
+            # Rappel local des saisies précédentes (commandes ET
+            # messages), comme un shell — jamais envoyé au serveur, ne
+            # fonctionne que pour cette connexion (voir input_history).
+            if not input_history:
+                continue
+
+            if key == curses.KEY_UP:
+                if _history_index is None:
+                    # Première pression : on mémorise ce qui était en
+                    # cours de frappe pour pouvoir y revenir en
+                    # redescendant au-delà du message le plus récent.
+                    _history_draft = input_text
+                    _history_index = len(input_history) - 1
+                elif _history_index > 0:
+                    _history_index -= 1
+                input_text = input_history[_history_index]
+            else:  # KEY_DOWN
+                if _history_index is None:
+                    continue
+                if _history_index < len(input_history) - 1:
+                    _history_index += 1
+                    input_text = input_history[_history_index]
+                else:
+                    # Au-delà du plus récent : retour au brouillon.
+                    _history_index = None
+                    input_text = _history_draft
+
+            _set_current_input_text(input_text)
+
+        elif key in (9, "\t"):
+            # Tab : complète avec la PREMIÈRE commande proposée (celle
+            # affichée en tête de la liste de suggestions au-dessus de
+            # la ligne de saisie — voir _matching_commands/draw_chat).
+            # Seulement tant que le nom de la commande est en cours de
+            # frappe (pas d'espace encore) : une fois les arguments
+            # commencés, il n'y a rien à compléter.
+            if " " not in input_text:
+                suggestions = _matching_commands(input_text)
+                if suggestions:
+                    input_text = suggestions[0][0] + " "
+                    _history_index = None
+                    _set_current_input_text(input_text)
+                    _maybe_send_typing(input_text)
+
+        elif isinstance(key, str) and key.isprintable():
+            input_text += key
+            _history_index = None  # on édite -> on quitte la navigation
+            _set_current_input_text(input_text)
+            _maybe_send_typing(input_text)
 
 
 def run_chat(window):
@@ -1487,6 +2125,25 @@ def run_chat(window):
 
 
 def main():
+    # Indispensable pour que curses gère correctement les caractères
+    # Unicode (accents, emoji...) en entrée ET en affichage — sans
+    # ceci, Python/curses reste bloqué en locale "C" (ASCII strict) et
+    # toute touche accentuée ou tout emoji est silencieusement perdu.
+    # Sur certains systèmes (conteneurs minimalistes, Windows sans
+    # locale UTF-8 installée...) la locale par défaut de l'utilisateur
+    # ("") n'existe pas et lève locale.Error. On retente alors avec
+    # "C.UTF-8" (toujours UTF-8, toujours disponible sur les systèmes
+    # récents) puis, en dernier recours, on continue sans bloquer :
+    # l'affichage restera correct dans la plupart des cas, seule la
+    # saisie de caractères très exotiques pourrait être affectée.
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        try:
+            locale.setlocale(locale.LC_ALL, "C.UTF-8")
+        except locale.Error:
+            pass
+
     try:
         curses.wrapper(run_chat)
     except KeyboardInterrupt:

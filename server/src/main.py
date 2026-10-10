@@ -13,7 +13,7 @@ Voir docs/architecture.md et docs/privacy.md pour le modèle de menace.
 
 from __future__ import annotations
 
-_SERVER_VERSION = "1.0.4"
+_SERVER_VERSION = "1.0.7"
 
 # ============================================================
 # BOOTSTRAP CLI — AVANT tout import lourd (FastAPI, cryptography...)
@@ -686,6 +686,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "typing_indicator",
                     "room": room_name,
                     "anonymous_number": sender_info.anonymous_number,
+                    # Signal démarré/arrêté (voir docs/crypto.md) : permet
+                    # au client d'afficher une indication dynamique façon
+                    # "X est en train d'écrire" qui disparaît quand X
+                    # arrête, plutôt qu'un simple événement ponctuel.
+                    "active": bool(control.get("active", True)),
                 },
                 room=room_name,
             )
@@ -715,6 +720,12 @@ def public_envelope(message: dict) -> dict:
         "created_at": message["created_at"],
         "anonymous_number": message["anonymous_number"],
         "room": message["room"],
+        # NULL pour tout ce qui ne consomme pas de numéro dans son
+        # salon (réactions, kx) — voir ROOM_SEQ_TYPES dans database.py.
+        # `message.get(...)` plutôt que `message[...]` : une base créée
+        # avant cette colonne ne l'a pas forcément tant que la requête
+        # ne la sélectionne pas explicitement (SELECT * la couvre ici).
+        "room_seq": message.get("room_seq"),
     }
 
 

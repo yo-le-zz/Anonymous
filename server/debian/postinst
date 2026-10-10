@@ -28,9 +28,31 @@ chmod 0700 "$DATA_DIR" "$DATA_DIR/files" "$LOG_DIR"
 
 # La configuration reste lisible par le groupe dédié uniquement — elle
 # peut contenir un hash de mot de passe (Argon2id, jamais le mot de
-# passe en clair, mais on reste prudent).
-chown root:"$ANON_GROUP" "$CONFIG_DIR/server.toml" 2>/dev/null || true
-chmod 0640 "$CONFIG_DIR/server.toml" 2>/dev/null || true
+# passe en clair, mais on reste prudent). Le paquet livre
+# server.toml en 0644 (voir build.sh : tous les fichiers du paquet
+# sont chmodés 0644 par défaut à la construction, aucun traitement
+# spécial pour celui-ci) — c'est CE bloc, exécuté à l'installation,
+# qui doit impérativement le resserrer.
+#
+# Bug réel corrigé : les `chown`/`chmod` ci-dessous avalaient
+# silencieusement toute erreur (`|| true`), donc un échec (droits
+# insuffisants, SELinux, etc.) laissait le fichier root:root 0644 —
+# lisible par n'importe quel utilisateur du système — SANS que
+# l'installation ne le signale. Les commandes sont désormais
+# bloquantes (`set -e` en tête de script) : un échec fait échouer
+# l'installation au lieu de se terminer avec des permissions fausses.
+#
+# On applique aussi ces permissions au DOSSIER lui-même (pas que
+# server.toml par son nom) : tout fichier de config supplémentaire
+# placé dans $CONFIG_DIR par la suite (ex. une liste de mots
+# bannis, voir [moderation] dans server.toml) hérite de la même
+# protection sans avoir besoin d'un ajout manuel ici.
+chown root:"$ANON_GROUP" "$CONFIG_DIR"
+chmod 0750 "$CONFIG_DIR"
+if [ -d "$CONFIG_DIR" ]; then
+    find "$CONFIG_DIR" -maxdepth 1 -type f -exec chown root:"$ANON_GROUP" {} \;
+    find "$CONFIG_DIR" -maxdepth 1 -type f -exec chmod 0640 {} \;
+fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 

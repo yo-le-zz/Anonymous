@@ -3,6 +3,184 @@
 Toutes les modifications notables de ce projet sont documentées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.0.7] — 2026-10-09
+
+### Ajouté (suite — retours d'usage réel sur 1.0.7)
+- **`/room leave`** : jusqu'ici, rien ne permettait de quitter le
+  salon actif sans se déconnecter entièrement du serveur. Réinitialise
+  l'état de salon (clé de chiffrement, abonnement WebSocket) sans
+  toucher à la session serveur.
+- **`/room new` et `/room join` simplifiés** : ils sont désormais de
+  simples alias de `/join` (dérivation déterministe par nom + mot de
+  passe optionnel, voir `crypto.Room.simple()`) au lieu de générer/
+  exiger une invitation à partager hors bande. `/room new <nom>` crée
+  un salon public, `/room new <nom> <mot_de_passe>` un salon protégé,
+  et `/room join <nom> [mot_de_passe]` rejoint directement — plus
+  d'étape d'invitation intermédiaire. Le compromis de confidentialité
+  que cela implique (le serveur connaît nom + mot de passe, voir
+  docs/crypto.md §13) est rappelé à l'utilisateur au moment de
+  rejoindre.
+- **Tab complète la première commande proposée** : les suggestions
+  au-dessus de la ligne de saisie n'étaient qu'un affichage passif.
+  Tab insère désormais directement la première commande suggérée
+  (tant que le nom de la commande est encore en cours de frappe).
+
+### Corrigé (suite)
+- **Impossible de valider un chemin de destination personnalisé au
+  téléchargement d'un fichier** : même bug qu'Entrée dans la boucle de
+  saisie principale (corrigé en 1.0.6), mais dans le prompt de
+  destination (`_prompt_line`) qui ne l'avait pas reçu — Entrée n'y
+  était testée que sous sa forme entière, pas sous la forme chaîne
+  ("\n"/"\r") que `get_wch()` peut aussi renvoyer selon le terminal.
+  Taper son propre chemin et appuyer sur Entrée ne faisait donc rien.
+- **Dossier de destination par défaut** pour les téléchargements :
+  utilise désormais le vrai dossier `~/Downloads` de l'utilisateur
+  (identique sous Windows et Linux/macOS) au lieu d'un sous-dossier
+  caché des données de l'application, qui n'est jamais ce à quoi on
+  s'attend et rendait les fichiers téléchargés difficiles à retrouver.
+- **Permissions du fichier de configuration serveur à l'installation**
+  (`server/debian/postinst`) : le paquet livre `server.toml` en 0644,
+  et le `chown`/`chmod` censé le resserrer à l'installation avalait
+  silencieusement toute erreur (`|| true`) — un échec (droits
+  insuffisants, SELinux...) laissait le fichier root:root 0644, lisible
+  par n'importe quel utilisateur du système, alors qu'il peut contenir
+  un hash de mot de passe. Les commandes sont désormais bloquantes :
+  un échec fait échouer l'installation plutôt que de se terminer avec
+  des permissions fausses sans le signaler.
+
+### Ajouté
+- **Numérotation des messages propre à chaque salon** (`room_seq`) :
+  le `#N` affiché devant chaque message repart de 1 dans chaque salon
+  au lieu d'utiliser l'id global en base. Les réactions (et les
+  échanges de clé) ne consomment JAMAIS ce numéro — seuls `msg` et
+  `file` en consomment un, exactement comme avant pour l'agrégation
+  des réactions, mais désormais sans collision entre salons distincts
+  partageant le même numéro. Migration automatique (`ALTER TABLE` +
+  rétro-remplissage `ROW_NUMBER() OVER (PARTITION BY room ...)`) pour
+  les bases déjà en production.
+- **`/download <N>`** accepte désormais le numéro affiché devant un
+  message-fichier (le même `#N` que `/react`/`/reply`) en plus du
+  file_id brut (gardé pour compatibilité ascendante) : plus besoin de
+  recopier un UUID illisible à la main. Le message ne l'affiche plus
+  dans son contenu — `/download` tout court suffit pour le dernier
+  fichier reçu.
+- **Historique local de saisie** (flèches haut/bas, comme un shell) :
+  rappelle les commandes et messages déjà tapés pendant la connexion
+  en cours (jamais envoyé au serveur ni persisté entre sessions),
+  avec préservation du brouillon en cours si on redescend au-delà du
+  message le plus récent.
+
+### Corrigé
+- **Une réaction pouvait s'afficher sur le mauvais message après un
+  changement de salon.** Changer de salon (`/room use`, `/join`, une
+  reconnexion) vidait `messages` mais pas l'agrégat des réactions : une
+  réaction du salon précédent pouvait rester accrochée à un message du
+  nouveau salon partageant le même numéro `#N` (la numérotation repart
+  de 1 dans chaque salon — voir ci-dessus). Les deux sont désormais
+  réinitialisés ensemble à chaque changement de salon.
+- **Une réaction de l'historique s'affichait comme sa propre ligne de
+  discussion** au lieu d'être agrégée à côté du message qu'elle cible :
+  l'historique rechargé au changement de salon contournait
+  `add_local_message` (qui fait l'agrégation) en ajoutant les messages
+  directement à la liste affichée. Il repasse désormais par le même
+  chemin que les messages reçus en direct.
+- **Workflow de release Docker en échec** (`repository name must be
+  lowercase`) : `ghcr.io/<repo>/...` utilisait `github.repository` tel
+  quel, qui garde la casse réelle du dépôt GitHub (ex. un `A`
+  majuscule) alors que Docker exige un nom entièrement en minuscules.
+  Le nom d'image est désormais calculé en minuscules une fois, puis
+  réutilisé pour les deux tags.
+- **Build Windows bloqué en CI** sur l'invite interactive de Nuitka
+  ("Proceed and download? [Yes]/No", pour Dependency Walker) :
+  non-interactif, le run restait bloqué jusqu'au timeout. Ajout de
+  `--assume-yes-for-downloads` aux deux compilations Nuitka
+  (client et serveur) sur le runner Windows, et par cohérence/défense
+  à `build.sh` (Linux) et `build-windows-cross.sh` (Wine).
+- **`build-windows-cross.sh` échouait à l'installation de Nuitka**
+  (`Cannot import 'setuptools.build_meta'`) : le Python "embeddable"
+  Windows n'a pas de backend de build disponible pour construire les
+  paquets qui n'ont pas de roue précompilée pour cette configuration
+  (le cas de `nuitka`, installé depuis son sdist). Ajout d'une mise à
+  jour explicite de `pip`/`setuptools`/`wheel` avant les autres
+  installations.
+
+## [1.0.6] — 2026-09-14
+
+### Corrigé
+- **Régression critique : Entrée n'envoyait plus rien** (ni message,
+  ni commande), introduite par le passage à `get_wch()` en v1.0.5 pour
+  corriger la saisie Unicode. Selon le terminal, `get_wch()` livre la
+  touche Entrée soit comme l'entier `curses.KEY_ENTER`, soit comme la
+  CHAÎNE `"\n"`/`"\r"` — le code ne testait Entrée que dans le cas
+  entier, donc la chaîne tombait dans la branche "texte", n'était pas
+  imprimable, et disparaissait silencieusement. Entrée (et Backspace,
+  vulnérable au même problème) sont désormais détectés indépendamment
+  du type retourné. Testé avec les deux formes, plus une
+  non-régression sur la saisie accentuée/emoji corrigée en 1.0.5.
+
+## [1.0.5] — 2026-09-13
+
+### Corrigé
+- **Impossible de taper des accents ou des emoji** (ex. chemins comme
+  `/home/ilan/Téléchargements`, réactions emoji) : le client
+  n'appelait jamais `locale.setlocale(locale.LC_ALL, "")` et utilisait
+  `getch()` (ASCII strict, 0-255) au lieu de `get_wch()` (Unicode).
+  Toute touche accentuée ou emoji était silencieusement perdue.
+  Corrigé — testé avec des accents et des emoji réels dans un message.
+- **Couleur des pseudos locaux (`/nick`) jamais appliquée** (seul le
+  nom l'était) : `draw_chat` ne consultait pas la couleur enregistrée.
+  Corrigé.
+- **Le même message d'indisponibilité s'affichait en rafale** :
+  ce n'était pas un doublon de code mais l'absence de regroupement —
+  chaque message non déchiffrable de l'historique (ex. reçu avant
+  d'avoir choisi un salon) produisait sa propre ligne identique. Les
+  lignes consécutives identiques sont désormais regroupées
+  (`"... (×N)"`).
+
+### Ajouté
+- **Salons "simples"** (`/join <salon> [mot_de_passe]`) : rejoint ou
+  crée un salon public/protégé par mot de passe SANS partage
+  d'invitation hors bande. Le secret de chiffrement est dérivé du nom
+  (+ mot de passe), avec un avertissement clair et honnête affiché à
+  l'utilisation : ce mode protège contre un observateur réseau passif,
+  **pas** contre le serveur lui-même (qui voit nécessairement le nom
+  et le mot de passe). `/room new` + invitation hors bande reste
+  disponible pour une confidentialité garantie même contre le serveur
+  — voir docs/crypto.md §13.
+- **Réactions et réponses sans avoir à compter les id** : `/react` et
+  `/reply` ciblent le DERNIER message par défaut ; `/react` seul
+  affiche un menu de 8 emoji prédéfinis numérotés. Les réactions
+  s'affichent désormais agrégées à côté du message ciblé
+  (`👍×2 😂×1`) au lieu de créer une ligne de discussion séparée par
+  réaction.
+- **Indicateur de frappe dynamique façon Discord** : ligne persistante
+  juste au-dessus de la zone de saisie (pas une suite de messages
+  système), qui agrège les noms ("X et Y sont en train d'écrire"),
+  bascule sur "Plusieurs personnes sont en train d'écrire..." au-delà
+  de deux, disparaît quand la personne arrête d'écrire ou tape une
+  commande, et s'auto-purge après quelques secondes d'inactivité si le
+  signal d'arrêt a été perdu (déconnexion brutale).
+- **Suggestions de commandes** : dès que la saisie commence par `/`,
+  jusqu'à 5 commandes correspondantes s'affichent au-dessus de la zone
+  de texte avec leur gabarit d'arguments, pour réduire le
+  copier-coller depuis `/help`.
+- **Téléchargement de fichier amélioré** (`/download [id]`) : id
+  optionnel (dernier fichier reçu par défaut), aperçu (nom, taille,
+  type) avant de télécharger, et invite interactive pour choisir/
+  confirmer le chemin de destination (avec confirmation avant d'écraser
+  un fichier existant).
+- **Numéro de message affiché** en petit devant chaque ligne de
+  discussion, pour cibler manuellement un message plus ancien avec
+  `/reply <id> ...` ou `/react ... <id>` quand la valeur par défaut
+  (dernier message) ne convient pas.
+- **`build-windows-cross.sh`** (expérimental) : tentative de
+  cross-compilation Windows depuis Linux via Wine, pour un test rapide
+  en local. Documenté honnêtement comme non fiable — Nuitka ne
+  supporte pas la compilation croisée au sens strict, et certaines
+  dépendances (code C compilé) peuvent échouer sous Wine. La voie
+  officielle pour les releases reste la compilation native sur un
+  runner Windows (`.github/workflows/release.yml`), déjà en place.
+
 ## [1.0.4] — 2026-09-11
 
 ### Ajouté
